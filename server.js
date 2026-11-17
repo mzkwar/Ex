@@ -84,7 +84,28 @@ setInterval(() => {
   if (externalUrl) {
     const client = externalUrl.startsWith('https') ? https : http;
     client.get(`${externalUrl}/ping`, (res) => {
-      console.log(`[Keep-Alive] Ping sent to ${externalUrl}/ping - Status: ${res.statusCode}`); }).on('error', (err) => { console.error('[Keep-Alive] Ping failed:', err.message); }); } }, 10 * 60 * 1000);  // ========================================== // 3. مسارات المصادقة (رئيسي FTTH + وكيل فرعي) // ==========================================  // تسجيل دخول الوكيل الرئيسي عبر منظومة FTTH app.post('/api/auth/login', async (req, res) => { const { username, password } = req.body; try { const params = new URLSearchParams(); params.append('grant_type', 'password'); params.append('client_id', 'earthlink-portals'); params.append('username', username); params.append('password', password);  const response = await axios.post(`${FTTH_BASE_URL}/auth/Contractor/token`, params.toString(), {
+      console.log(`[Keep-Alive] Ping sent to ${externalUrl}/ping - Status: ${res.statusCode}`);
+    }).on('error', (err) => {
+      console.error('[Keep-Alive] Ping failed:', err.message);
+    });
+  }
+}, 10 * 60 * 1000);
+
+// ==========================================
+// 3. مسارات المصادقة (رئيسي FTTH + وكيل فرعي)
+// ==========================================
+
+// تسجيل دخول الوكيل الرئيسي عبر منظومة FTTH
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const params = new URLSearchParams();
+    params.append('grant_type', 'password');
+    params.append('client_id', 'earthlink-portals');
+    params.append('username', username);
+    params.append('password', password);
+
+    const response = await axios.post(`${FTTH_BASE_URL}/auth/Contractor/token`, params.toString(), {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json'
@@ -1189,4 +1210,359 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       }
 
       tbody.innerHTML = state.filteredSubscribers.map((s, idx) => {
-        const isChecked = state.selectedIds.has
+        const isChecked = state.selectedIds.has(s.id) ? 'checked' : '';
+        const onlineBadge = s.isOnline
+          ? '<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-400"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></span>متصل</span>'
+          : '<span class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-bold bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400">غير متصل</span>';
+
+        return \`
+          <tr class="hover:bg-slate-50 dark:hover:bg-slate-800/50 transition">
+            \${isAdmin ? \`<td class="p-3.5 text-center"><input type="checkbox" \${isChecked} onchange="toggleRowSelect('\${s.id}')" class="rounded border-slate-300" /></td>\` : ''}
+            <td class="p-3.5 font-mono text-xs text-slate-400">\${idx + 1}</td>
+            <td class="p-3.5 font-bold text-slate-900 dark:text-white">\${s.fullName}</td>
+            <td class="p-3.5 font-mono text-xs" dir="ltr">\${s.phone}</td>
+            <td class="p-3.5 text-xs font-medium">\${s.zone}</td>
+            <td class="p-3.5 text-xs font-mono">\${s.fat}</td>
+            <td class="p-3.5 text-xs font-bold text-brand-600 dark:text-brand-400">\${s.bundle}</td>
+            <td class="p-3.5">\${onlineBadge}</td>
+            \${isAdmin ? \`<td class="p-3.5 text-xs">\${s.subAgentName ? \`<span class="px-2 py-1 rounded-lg bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300 font-bold">\${s.subAgentName}</span>\` : '<span class="text-slate-400">رئيسي</span>'}</td>\` : ''}
+            <td class="p-3.5 text-center">
+              <button onclick="openSubscriberDetail('\${s.id}')" class="px-3 py-1.5 bg-brand-50 hover:bg-brand-600 text-brand-600 hover:text-white dark:bg-slate-800 dark:text-brand-400 rounded-lg text-xs font-bold transition">
+                عرض التفاصيل
+              </button>
+            </td>
+          </tr>
+        \`;
+      }).join('');
+    }
+
+    // تحديد الصفوف للتحويل
+    function toggleRowSelect(id) {
+      if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+      else state.selectedIds.add(id);
+      updateAssignBar();
+    }
+
+    function toggleSelectAll(checkbox) {
+      if (checkbox.checked) {
+        state.filteredSubscribers.forEach(s => state.selectedIds.add(s.id));
+      } else {
+        state.selectedIds.clear();
+      }
+      renderSubscribersTable();
+      updateAssignBar();
+    }
+
+    function updateAssignBar() {
+      const bar = document.getElementById('assign-bar');
+      const count = state.selectedIds.size;
+      document.getElementById('selected-count').textContent = count;
+      bar.classList.toggle('hidden', count === 0 || state.role !== 'admin');
+    }
+
+    // تصدير Excel باستخدام SheetJS
+    function exportToExcel(mode) {
+      const source = mode === 'all' ? state.allSubscribers : state.filteredSubscribers;
+      if (source.length === 0) {
+        showToast('لا توجد بيانات لتصديرها', 'error');
+        return;
+      }
+
+      const rows = source.map((s, idx) => ({
+        'التسلسل': idx + 1,
+        'اسم المشترك': s.fullName,
+        'رقم الهاتف': s.phone,
+        'الزون (Zone)': s.zone,
+        'الفات (FAT)': s.fat,
+        'الباقة': s.bundle,
+        'حالة الاتصال': s.isOnline ? 'متصل' : 'غير متصل'
+      }));
+
+      const worksheet = XLSX.utils.json_to_sheet(rows);
+      worksheet['!cols'] = [{ wch: 8 }, { wch: 28 }, { wch: 16 }, { wch: 18 }, { wch: 15 }, { wch: 20 }, { wch: 14 }];
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, worksheet, 'مشتركي مركز وار');
+
+      const fileName = \`War_Center_Subscribers_\${new Date().toISOString().slice(0, 10)}.xlsx\`;
+      XLSX.writeFile(workbook, fileName);
+      showToast(\`تم تصدير \${rows.length} مشترك إلى ملف Excel بنجاح\`, 'success');
+    }
+
+    // ==========================================
+    // صفحة تفاصيل المشترك المستقلة (ONT + Session + Maps)
+    // ==========================================
+    async function openSubscriberDetail(subId) {
+      const sub = state.allSubscribers.find(s => s.id === subId);
+      if (!sub) return;
+      state.currentDetailSub = sub;
+
+      switchTab('subscriber-detail');
+      document.getElementById('detail-sub-id').textContent = \`ID: \${sub.id}\`;
+      document.getElementById('detail-name').textContent = sub.fullName;
+      document.getElementById('detail-username').textContent = sub.username;
+      document.getElementById('detail-phone').textContent = sub.phone;
+      document.getElementById('detail-zone').textContent = sub.zone;
+      document.getElementById('detail-fat').textContent = sub.fat;
+      document.getElementById('detail-bundle').textContent = sub.bundle;
+      document.getElementById('detail-activation').textContent = sub.activationDate ? new Date(sub.activationDate).toLocaleDateString('ar-IQ') : 'غير متوفر';
+      document.getElementById('detail-expiration').textContent = sub.expirationDate ? new Date(sub.expirationDate).toLocaleDateString('ar-IQ') : 'غير متوفر';
+
+      // استخراج الإحداثيات الجغرافية
+      const lat = sub.rawCustomer?.latitude || sub.rawSubscription?.latitude || sub.rawCustomer?.lat;
+      const lng = sub.rawCustomer?.longitude || sub.rawSubscription?.longitude || sub.rawCustomer?.lng;
+      const mapBtn = document.getElementById('detail-maps-link');
+      if (lat && lng) {
+        mapBtn.href = \`https://www.google.com/maps?q=\${lat},\${lng}\`;
+        mapBtn.classList.remove('opacity-50', 'pointer-events-none');
+      } else {
+        mapBtn.href = \`https://www.google.com/maps/search/\${encodeURIComponent(sub.zone + ' ' + sub.fat)}\`;
+      }
+
+      await reloadOntAndSession();
+    }
+
+    async function reloadOntAndSession() {
+      const sub = state.currentDetailSub;
+      if (!sub) return;
+
+      const ontBox = document.getElementById('ont-data-container');
+      const sesBox = document.getElementById('session-data-container');
+      ontBox.innerHTML = '<div class="p-4 text-center text-slate-400 animate-pulse">جاري قراءة إشارة ONT...</div>';
+      sesBox.innerHTML = '<div class="p-4 text-center text-slate-400 animate-pulse">جاري فحص الجلسة النشطة...</div>';
+
+      const headers = { 'x-ftth-token': state.token };
+
+      // فحص ONT
+      fetch(\`/api/ftth/ont?subscriptionId=\${sub.id}\`, { headers })
+        .then(r => r.json())
+        .then(data => {
+          const rx = data.rxPower ?? data.opticalRxPower ?? data.signal ?? 'غير متاح';
+          const tx = data.txPower ?? data.opticalTxPower ?? 'غير متاح';
+          const status = data.status || data.operState || 'غير معروف';
+          const rxNum = parseFloat(rx);
+          const signalColor = !isNaN(rxNum) ? (rxNum >= -25 ? 'text-emerald-600' : rxNum >= -28 ? 'text-amber-500' : 'text-red-600') : 'text-slate-700 dark:text-slate-200';
+
+          ontBox.innerHTML = \`
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">حالة الجهاز:</span><span class="font-bold">\${status}</span></div>
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">قراءة الإشارة (Rx Power):</span><span class="font-extrabold font-mono \${signalColor}" dir="ltr">\${rx} dBm</span></div>
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">إرسال (Tx Power):</span><span class="font-bold font-mono" dir="ltr">\${tx} dBm</span></div>
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">Serial Number:</span><span class="font-mono text-xs">\${data.serialNumber || data.sn || '-'}</span></div>
+          \`;
+        })
+        .catch(() => {
+          ontBox.innerHTML = '<div class="p-4 text-center text-red-500 text-xs font-bold">تعذر الوصول إلى جهاز ONT حالياً.</div>';
+        });
+
+      // فحص الجلسة النشطة
+      fetch(\`/api/ftth/sessions?subscriptionId=\${sub.id}\`, { headers })
+        .then(r => r.json())
+        .then(data => {
+          const session = Array.isArray(data) ? data[0] : (data.items?.[0] || data);
+          if (!session || (!session.ipAddress && !session.framedIpAddress && !session.macAddress)) {
+            sesBox.innerHTML = '<div class="p-4 text-center text-slate-400 font-bold">لا توجد جلسة اتصال نشطة حالياً.</div>';
+            return;
+          }
+          sesBox.innerHTML = \`
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">عنوان IP:</span><span class="font-mono font-bold text-brand-600" dir="ltr">\${session.ipAddress || session.framedIpAddress || '-'}</span></div>
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">عنوان MAC:</span><span class="font-mono font-bold" dir="ltr">\${session.macAddress || session.callingStationId || '-'}</span></div>
+            <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">مدة الاتصال (Uptime):</span><span class="font-bold">\${session.uptime || session.duration || 'متصل الآن'}</span></div>
+          \`;
+        })
+        .catch(() => {
+          sesBox.innerHTML = '<div class="p-4 text-center text-red-500 text-xs font-bold">تعذر جلب تفاصيل الجلسة.</div>';
+        });
+    }
+
+    // ==========================================
+    // إدارة الوكلاء الثانويين
+    // ==========================================
+    async function loadSubAgents() {
+      const res = await fetch('/api/admin/sub-agents');
+      state.subAgents = await res.json();
+
+      // تحديث القائمة المنسدلة للتحويل
+      const select = document.getElementById('assign-agent-select');
+      select.innerHTML = '<option value="">-- اختر الوكيل الثانوي --</option><option value="unassign">إلغاء التعيين (إرجاع للرئيسي)</option>' +
+        state.subAgents.map(a => \`<option value="\${a.id}">\${a.name} (\${a.subscriber_count} مشترك)</option>\`).join('');
+
+      // تحديث الجدول
+      const tbody = document.getElementById('agents-tbody');
+      if (state.subAgents.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" class="p-6 text-center text-slate-400">لم يتم إضافة وكلاء ثانويين بعد.</td></tr>';
+        return;
+      }
+      tbody.innerHTML = state.subAgents.map(a => \`
+        <tr>
+          <td class="p-3 font-bold">\${a.name}</td>
+          <td class="p-3 font-mono text-xs">\${a.username}</td>
+          <td class="p-3 font-mono text-xs">\${a.phone || '-'}</td>
+          <td class="p-3 text-center"><span class="px-2.5 py-1 rounded-full bg-brand-100 text-brand-700 dark:bg-brand-950 dark:text-brand-300 font-bold text-xs">\${a.subscriber_count}</span></td>
+          <td class="p-3 text-center">
+            <button onclick="deleteSubAgent(\${a.id})" class="text-red-500 hover:underline text-xs font-bold">حذف</button>
+          </td>
+        </tr>
+      \`).join('');
+    }
+
+    document.getElementById('add-agent-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const name = document.getElementById('agent-name').value.trim();
+      const username = document.getElementById('agent-username').value.trim();
+      const password = document.getElementById('agent-password').value;
+      const phone = document.getElementById('agent-phone').value.trim();
+
+      try {
+        const res = await fetch('/api/admin/sub-agents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, username, password, phone })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message);
+
+        e.target.reset();
+        showToast('تم إنشاء حساب الوكيل الثانوي بنجاح', 'success');
+        await loadSubAgents();
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    });
+
+    async function deleteSubAgent(id) {
+      if (!confirm('هل أنت متأكد من حذف هذا الوكيل؟')) return;
+      await fetch(\`/api/admin/sub-agents/\${id}\`, { method: 'DELETE' });
+      showToast('تم حذف الوكيل', 'info');
+      await fetchAllData();
+    }
+
+    async function assignSelectedSubscribers() {
+      const sub_agent_id = document.getElementById('assign-agent-select').value;
+      if (!sub_agent_id) {
+        showToast('يرجى اختيار الوكيل الثانوي أولاً', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/admin/assign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sub_agent_id,
+            subscription_ids: Array.from(state.selectedIds)
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message);
+
+        state.selectedIds.clear();
+        updateAssignBar();
+        showToast(data.message, 'success');
+        await fetchAllData();
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // ==========================================
+    // المحفظة والحركات المالية
+    // ==========================================
+    async function loadFinance() {
+      try {
+        const res = await fetch('/api/ftth/finance', { headers: { 'x-ftth-token': state.token } });
+        const data = await res.json();
+
+        const bal = data.wallet?.balance ?? data.wallet?.availableBalance ?? 0;
+        document.getElementById('wallet-balance').textContent = \`\${Number(bal).toLocaleString()} IQD\`;
+
+        state.transactions = data.transactions || [];
+        const cardCount = state.transactions.filter(t => (t.paymentMode || '').toLowerCase() === 'card').length;
+        const walletCount = state.transactions.filter(t => (t.paymentMode || '').toLowerCase() === 'wallet').length;
+
+        document.getElementById('card-payments-count').textContent = \`\${cardCount} عملية\`;
+        document.getElementById('wallet-payments-count').textContent = \`\${walletCount} عملية\`;
+        renderTransactions();
+      } catch (e) { console.error(e); }
+    }
+
+    function renderTransactions() {
+      const filter = document.getElementById('payment-mode-filter').value;
+      const tbody = document.getElementById('transactions-tbody');
+
+      const filtered = state.transactions.filter(tx => {
+        if (filter === 'all') return true;
+        return (tx.paymentMode || '').toLowerCase() === filter.toLowerCase();
+      });
+
+      if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" class="p-6 text-center text-slate-400">لا توجد حركات مالية مطابقة.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = filtered.map(tx => {
+        const mode = tx.paymentMode || 'Wallet';
+        const isCard = mode.toLowerCase() === 'card';
+        const modeBadge = isCard
+          ? '<span class="px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-700">دفع المشترك (Card)</span>'
+          : '<span class="px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-700">دفع الوكيل (Wallet)</span>';
+
+        return \`
+          <tr>
+            <td class="p-3 text-xs font-mono">\${tx.createdAt ? new Date(tx.createdAt).toLocaleString('ar-IQ') : '-'}</td>
+            <td class="p-3 font-bold">\${tx.description || tx.customerName || tx.type || 'عملية مالية'}</td>
+            <td class="p-3">\${modeBadge}</td>
+            <td class="p-3 font-extrabold font-mono" dir="ltr">\${Number(tx.amount || 0).toLocaleString()} IQD</td>
+          </tr>
+        \`;
+      }).join('');
+    }
+
+    // ==========================================
+    // الدعم الفني ومهام التنصيب
+    // ==========================================
+    async function loadOperations() {
+      try {
+        const res = await fetch('/api/ftth/operations', { headers: { 'x-ftth-token': state.token } });
+        const data = await res.json();
+
+        const ticketsBox = document.getElementById('tickets-list');
+        const requestsBox = document.getElementById('requests-list');
+
+        ticketsBox.innerHTML = (data.tickets || []).length === 0
+          ? '<p class="text-sm text-slate-400 text-center py-4">لا توجد تذاكر دعم فني حالياً.</p>'
+          : data.tickets.slice(0, 15).map(t => \`
+            <div class="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700 flex justify-between items-center">
+              <div>
+                <div class="font-bold text-sm">\${t.subject || t.title || 'تذكرة دعم'}</div>
+                <div class="text-xs text-slate-500">\${t.customerName || ''} • \${t.status || 'مفتوحة'}</div>
+              </div>
+              <span class="text-xs font-mono bg-white dark:bg-slate-900 px-2 py-1 rounded border">#\${t.id || ''}</span>
+            </div>
+          \`).join('');
+
+        requestsBox.innerHTML = (data.requests || []).length === 0
+          ? '<p class="text-sm text-slate-400 text-center py-4">لا توجد مهام تنصيب حالياً.</p>'
+          : data.requests.slice(0, 15).map(r => \`
+            <div class="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700 flex justify-between items-center">
+              <div>
+                <div class="font-bold text-sm">\${r.customerName || r.title || 'طلب تنصيب جديد'}</div>
+                <div class="text-xs text-slate-500">\${r.zoneName || ''} • \${r.status || 'قيد التنفيذ'}</div>
+              </div>
+              <span class="text-xs font-mono bg-white dark:bg-slate-900 px-2 py-1 rounded border">#\${r.id || ''}</span>
+            </div>
+          \`).join('');
+      } catch (e) { console.error(e); }
+    }
+  </script>
+</body>
+</html>`;
+
+// تقديم الواجهة الأمامية المدمجة لجميع المسارات غير الـ API
+app.get('*', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(HTML_TEMPLATE);
+});
+
+// تشغيل الخادم
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(\`🚀 خادم مركز وار لخدمات الإنترنت يعمل على المنفذ: \${PORT}\`);
+});
