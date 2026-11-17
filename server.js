@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
-// صفحة الـ HTML المدمجة لإدارة وعرض وتصدير المشتركين
+// صفحة الـ HTML المدمجة مع تأكيد استمرار حالة التحميل لحين الاكتمال
 app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="ar" dir="rtl" class="dark">
@@ -103,7 +103,7 @@ app.get('/', (req, res) => {
                             </tr>
                         </thead>
                         <tbody id="subscribers-tbody" class="divide-y divide-slate-200 dark:divide-slate-700/60 font-medium">
-                            <tr><td colspan="5" class="p-8 text-center text-slate-400 font-bold animate-pulse">جاري جلب المشتركين...</td></tr>
+                            <tr><td colspan="5" class="p-12 text-center text-indigo-500 font-bold animate-pulse text-base">⏳ جاري سحب وتحميل بيانات المشتركين من المنظومة... يرجى الانتظار لحين الاكتمال</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -179,7 +179,8 @@ app.get('/', (req, res) => {
 
         async function loadSubscribers() {
             const tbody = document.getElementById('subscribers-tbody');
-            tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-slate-400 font-bold animate-pulse">جاري سحب بيانات المشتركين...</td></tr>';
+            // استمرار إظهار شاشة التحميل لحين الاكتمال التام
+            tbody.innerHTML = '<tr><td colspan="5" class="p-12 text-center text-indigo-500 font-bold animate-pulse text-base">⏳ جاري سحب وتحميل بيانات المشتركين من المنظومة... يرجى الانتظار لحين الاكتمال</td></tr>';
 
             try {
                 const res = await fetch('/api/ftth/subscribers-all', {
@@ -192,9 +193,15 @@ app.get('/', (req, res) => {
                     return;
                 }
 
-                if (!res.ok) throw new Error('فشل الجلب');
+                if (!res.ok) throw new Error('فشل الجلب من الخادم');
 
                 const data = await res.json();
+                
+                if (!Array.isArray(data) || data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-amber-500 font-bold">لا توجد بيانات متاحة حالياً أو أن الحساب لا يملك مشتركين مسجلين.</td></tr>';
+                    return;
+                }
+
                 allSubscribers = data.map(sub => {
                     const name = extractVal(sub.customer) || extractVal(sub.subscriber) || 'غير محدد';
                     const phone = sub.phone || sub.mobile || sub.customer?.phone || sub.customer?.mobile || 'غير مسجل';
@@ -208,7 +215,8 @@ app.get('/', (req, res) => {
                 renderTable(filteredSubscribers);
                 showToast(\`تم تحميل \${allSubscribers.length} مشترك بنجاح\`);
             } catch (err) {
-                tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-rose-500 font-bold">تعذر جلب البيانات من المنظومة</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="p-12 text-center text-rose-500 font-bold text-base">❌ تعذر جلب البيانات من المنظومة. يرجى إعادة المحاولة أو تسجيل الدخول من جديد.</td></tr>';
+                showToast("تعذر جلب البيانات", "error");
             }
         }
 
@@ -219,7 +227,7 @@ app.get('/', (req, res) => {
             tbody.innerHTML = '';
 
             if (list.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-slate-400 font-bold">لا توجد نتائج</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-slate-400 font-bold">لا توجد نتائج مطابقة للبحث</td></tr>';
                 return;
             }
 
@@ -232,7 +240,7 @@ app.get('/', (req, res) => {
                             \${item.phone !== 'غير مسجل' ? \`<a href="tel:\${item.phone}" class="text-emerald-500 font-bold hover:underline">\${item.phone}</a>\` : '<span class="text-slate-400 text-xs">غير مسجل</span>'}
                         </td>
                         <td class="p-4 font-bold text-slate-700 dark:text-slate-200">\${item.zone}</td>
-                        <td class="p-4 font-mono font-bold text-amber-600 dark:text-amber-400">\cite{item.fat}</td>
+                        <td class="p-4 font-mono font-bold text-amber-600 dark:text-amber-400">\${item.fat}</td>
                     </tr>
                 \`;
             });
@@ -280,12 +288,12 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-// مسار فحص الصحة المخصص لخدمة عدم النوم (Keep-Alive)
+// مسار فحص الصحة للإيقاظ (Keep-Alive)
 app.get('/ping', (req, res) => {
     res.status(200).send('Server is alive!');
 });
 
-// مسار تسجيل الدخول الوسيط
+// مسار تسجيل الدخول
 app.post('/api/ftth/login', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -346,19 +354,10 @@ const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
     console.log(`🚀 السيرفر يعمل على Port ${PORT}`);
     
-    // === كود عدم النوم (Keep-Alive) لـ Render ===
-    // سيقوم السيرفر بإرسال طلب لنفسه كل 10 دقائق (600000 مللي ثانية) ليبقى نشطاً دائماً
+    // كود عدم النوم (Keep-Alive)
     const INTERVAL_TIME = 10 * 60 * 1000; 
     setInterval(() => {
-        // استبدل الرابط أدناه برابط مشروعك الحقيقي على Render فور حصولك عليه
         const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-        
-        axios.get(`${RENDER_URL}/ping`)
-            .then(() => {
-                console.log("⏰ تم إرسال نبضة إيقاظ للسيرفر بنجاح.");
-            })
-            .catch((err) => {
-                console.log("⚠️ فشل إرسال نبضة الإيقاظ:", err.message);
-            });
+        axios.get(`${RENDER_URL}/ping`).catch(() => {});
     }, INTERVAL_TIME);
 });
