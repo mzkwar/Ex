@@ -232,7 +232,7 @@ app.get('/', (req, res) => {
                             \${item.phone !== 'غير مسجل' ? \`<a href="tel:\${item.phone}" class="text-emerald-500 font-bold hover:underline">\${item.phone}</a>\` : '<span class="text-slate-400 text-xs">غير مسجل</span>'}
                         </td>
                         <td class="p-4 font-bold text-slate-700 dark:text-slate-200">\${item.zone}</td>
-                        <td class="p-4 font-mono font-bold text-amber-600 dark:text-amber-400">\${item.fat}</td>
+                        <td class="p-4 font-mono font-bold text-amber-600 dark:text-amber-400">\cite{item.fat}</td>
                     </tr>
                 \`;
             });
@@ -278,6 +278,11 @@ app.get('/', (req, res) => {
     </script>
 </body>
 </html>`);
+});
+
+// مسار فحص الصحة المخصص لخدمة عدم النوم (Keep-Alive)
+app.get('/ping', (req, res) => {
+    res.status(200).send('Server is alive!');
 });
 
 // مسار تسجيل الدخول الوسيط
@@ -338,4 +343,22 @@ app.get('/api/ftth/subscribers-all', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 السيرفر يعمل على Port ${PORT}`));
+const server = app.listen(PORT, () => {
+    console.log(`🚀 السيرفر يعمل على Port ${PORT}`);
+    
+    // === كود عدم النوم (Keep-Alive) لـ Render ===
+    // سيقوم السيرفر بإرسال طلب لنفسه كل 10 دقائق (600000 مللي ثانية) ليبقى نشطاً دائماً
+    const INTERVAL_TIME = 10 * 60 * 1000; 
+    setInterval(() => {
+        // استبدل الرابط أدناه برابط مشروعك الحقيقي على Render فور حصولك عليه
+        const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+        
+        axios.get(`${RENDER_URL}/ping`)
+            .then(() => {
+                console.log("⏰ تم إرسال نبضة إيقاظ للسيرفر بنجاح.");
+            })
+            .catch((err) => {
+                console.log("⚠️ فشل إرسال نبضة الإيقاظ:", err.message);
+            });
+    }, INTERVAL_TIME);
+});
