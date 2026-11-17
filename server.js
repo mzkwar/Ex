@@ -1,363 +1,1192 @@
 const express = require('express');
 const axios = require('axios');
-const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+const http = require('http');
+const https = require('https');
 
 const app = express();
-app.use(express.json());
-app.use(cors());
+const PORT = process.env.PORT || 10000;
+const JWT_SECRET = process.env.JWT_SECRET || 'war_ftth_super_secret_key_2026';
+const FTTH_BASE_URL = 'https://admin.ftth.iq/api';
 
-// صفحة الـ HTML المدمجة مع تأكيد استمرار حالة التحميل لحين الاكتمال
-app.get('/', (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html lang="ar" dir="rtl" class="dark">
+// إعدادات Express
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ==========================================
+// 1. قاعدة البيانات المحلية SQLite3
+// ==========================================
+const dbPath = path.join(__dirname, 'war_center.db');
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) console.error('خطأ في الاتصال بقاعدة البيانات:', err.message);
+  else console.log('✅ تم الاتصال بقاعدة بيانات SQLite بنجاح.');
+});
+
+db.serialize(() => {
+  // جدول الوكلاء الثانويين
+  db.run(`
+    CREATE TABLE IF NOT EXISTS sub_agents (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      username TEXT UNIQUE NOT NULL,
+      password TEXT NOT NULL,
+      phone TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // جدول ربط المشتركين بالوكلاء الثانويين
+  db.run(`
+    CREATE TABLE IF NOT EXISTS assigned_subscribers (
+      subscription_id TEXT PRIMARY KEY,
+      sub_agent_id INTEGER NOT NULL,
+      assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (sub_agent_id) REFERENCES sub_agents(id) ON DELETE CASCADE
+    )
+  `);
+});
+
+// دوال مساعدة للتعامل مع SQLite بـ Promises
+const dbRun = (sql, params = []) => new Promise((resolve, reject) => {
+  db.run(sql, params, function (err) {
+    if (err) reject(err);
+    else resolve(this);
+  });
+});
+
+const dbAll = (sql, params = []) => new Promise((resolve, reject) => {
+  db.all(sql, params, (err, rows) => {
+    if (err) reject(err);
+    else resolve(rows);
+  });
+});
+
+const dbGet = (sql, params = []) => new Promise((resolve, reject) => {
+  db.get(sql, params, (err, row) => {
+    if (err) reject(err);
+    else resolve(row);
+  });
+});
+
+// ==========================================
+// 2. مسار Keep-Alive لمنع سبات Render
+// ==========================================
+app.get('/ping', (req, res) => {
+  res.status(200).json({ status: 'alive', service: 'War Internet Center', timestamp: new Date().toISOString() });
+});
+
+// مؤقت داخلي كل 10 دقائق
+setInterval(() => {
+  const externalUrl = process.env.RENDER_EXTERNAL_URL;
+  if (externalUrl) {
+    const client = externalUrl.startsWith('https') ? https : http;
+    client.get(`${externalUrl}/ping`, (res) => {
+      console.log(`[Keep-Alive] Ping sent to ${externalUrl}/ping - Status: ${res.statusCode}`); }).on('error', (err) => { console.error('[Keep-Alive] Ping failed:', err.message); }); } }, 10 * 60 * 1000);  // ========================================== // 3. مسارات المصادقة (رئيسي FTTH + وكيل فرعي) // ==========================================  // تسجيل دخول الوكيل الرئيسي عبر منظومة FTTH app.post('/api/auth/login', async (req, res) => { const { username, password } = req.body; try { const params = new URLSearchParams(); params.append('grant_type', 'password'); params.append('client_id', 'earthlink-portals'); params.append('username', username); params.append('password', password);  const response = await axios.post(`${FTTH_BASE_URL}/auth/Contractor/token`, params.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json'
+      }
+    });
+
+    const data = response.data;
+    const token = data.access_token || data.token || (data.data && data.data.access_token);
+
+    if (!token) {
+      return res.status(401).json({ message: 'لم يتم العثور على رمز الدخول في استجابة المنظومة.' });
+    }
+
+    res.json({
+      role: 'admin',
+      token,
+      username,
+      expires_in: data.expires_in || 86400
+    });
+  } catch (error) {
+    const status = error.response?.status || 500;
+    const msg = error.response?.data?.error_description || error.response?.data?.message || 'فشل تسجيل الدخول. تأكد من اسم المستخدم وكلمة المرور.';
+    res.status(status).json({ message: msg });
+  }
+});
+
+// تسجيل دخول الوكيل الثانوي المحلي
+app.post('/api/auth/sub-login', async (req, res) => {
+  const { username, password, masterToken } = req.body;
+  try {
+    const agent = await dbGet('SELECT * FROM sub_agents WHERE username = ?', [username]);
+    if (!agent) {
+      return res.status(401).json({ message: 'اسم مستخدم الوكيل الثانوي غير صحيح.' });
+    }
+
+    const isMatch = await bcrypt.compare(password, agent.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'كلمة المرور غير صحيحة.' });
+    }
+
+    const localToken = jwt.sign(
+      { id: agent.id, username: agent.username, name: agent.name, role: 'sub_agent' },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      role: 'sub_agent',
+      token: localToken,
+      agent: { id: agent.id, name: agent.name, username: agent.username }
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'خطأ في الخادم أثناء تسجيل دخول الوكيل الفرعي.' });
+  }
+});
+
+// ==========================================
+// 4. مسارات إدارة الوكلاء الثانويين والتوزيع
+// ==========================================
+
+// جلب قائمة الوكلاء الثانويين مع إحصاء المشتركين
+app.get('/api/admin/sub-agents', async (req, res) => {
+  try {
+    const agents = await dbAll(`
+      SELECT 
+        sa.id, sa.name, sa.username, sa.phone, sa.created_at,
+        COUNT(asub.subscription_id) AS subscriber_count
+      FROM sub_agents sa
+      LEFT JOIN assigned_subscribers asub ON sa.id = asub.sub_agent_id
+      GROUP BY sa.id
+      ORDER BY sa.created_at DESC
+    `);
+    res.json(agents);
+  } catch (err) {
+    res.status(500).json({ message: 'فشل جلب الوكلاء الثانويين', error: err.message });
+  }
+});
+
+// إضافة وكيل ثانوي جديد
+app.post('/api/admin/sub-agents', async (req, res) => {
+  const { name, username, password, phone } = req.body;
+  if (!name || !username || !password) {
+    return res.status(400).json({ message: 'الاسم واسم المستخدم وكلمة المرور حقول مطلوبة.' });
+  }
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const result = await dbRun(
+      'INSERT INTO sub_agents (name, username, password, phone) VALUES (?, ?, ?, ?)',
+      [name, username, hashedPassword, phone || '']
+    );
+    res.status(201).json({ id: result.lastID, name, username, phone, message: 'تمت إضافة الوكيل بنجاح' });
+  } catch (err) {
+    if (err.message.includes('UNIQUE')) {
+      return res.status(400).json({ message: 'اسم المستخدم مستخدم مسبقاً.' });
+    }
+    res.status(500).json({ message: 'خطأ أثناء إضافة الوكيل', error: err.message });
+  }
+});
+
+// حذف وكيل ثانوي
+app.delete('/api/admin/sub-agents/:id', async (req, res) => {
+  try {
+    await dbRun('DELETE FROM assigned_subscribers WHERE sub_agent_id = ?', [req.params.id]);
+    await dbRun('DELETE FROM sub_agents WHERE id = ?', [req.params.id]);
+    res.json({ message: 'تم حذف الوكيل وإلغاء ربط مشتركيه.' });
+  } catch (err) {
+    res.status(500).json({ message: 'فشل حذف الوكيل' });
+  }
+});
+
+// تحويل وتوزيع المشتركين المحددين إلى وكيل ثانوي
+app.post('/api/admin/assign', async (req, res) => {
+  const { sub_agent_id, subscription_ids } = req.body;
+  if (!Array.isArray(subscription_ids) || subscription_ids.length === 0) {
+    return res.status(400).json({ message: 'يرجى تحديد مشترك واحد على الأقل.' });
+  }
+
+  try {
+    if (sub_agent_id === 'unassign' || !sub_agent_id) {
+      const placeholders = subscription_ids.map(() => '?').join(',');
+      await dbRun(`DELETE FROM assigned_subscribers WHERE subscription_id IN (${placeholders})`, subscription_ids);
+      return res.json({ message: `تم إلغاء تعيين ${subscription_ids.length} مشترك.` });
+    }
+
+    for (const subId of subscription_ids) {
+      await dbRun(
+        `INSERT INTO assigned_subscribers (subscription_id, sub_agent_id) 
+         VALUES (?, ?) 
+         ON CONFLICT(subscription_id) DO UPDATE SET sub_agent_id = excluded.sub_agent_id, assigned_at = CURRENT_TIMESTAMP`,
+        [String(subId), sub_agent_id]
+      );
+    }
+    res.json({ message: `تم تحويل ${subscription_ids.length} مشترك بنجاح.` });
+  } catch (err) {
+    res.status(500).json({ message: 'حدث خطأ أثناء تحويل المشتركين', error: err.message });
+  }
+});
+
+// ==========================================
+// 5. تكامل APIs منظومة FTTH ودمج البيانات
+// ==========================================
+
+// دالة مساعدة لتمرير الطلبات إلى admin.ftth.iq
+async function ftthRequest(endpoint, token, params = {}) {
+  const cleanToken = token.replace(/^Bearer\s+/i, '');
+  const response = await axios.get(`${FTTH_BASE_URL}${endpoint}`, {
+    params,
+    headers: {
+      'Authorization': `Bearer ${cleanToken}`,
+      'Accept': 'application/json'
+    },
+    timeout: 25000
+  });
+  return response.data;
+}
+
+// جلب ودمج الاشتراكات + العملاء + ربط الوكلاء المحليين
+app.get('/api/ftth/merged-subscribers', async (req, res) => {
+  const ftthToken = req.headers['x-ftth-token'];
+  const subAgentId = req.headers['x-sub-agent-id']; // في حال دخول وكيل ثانوي
+
+  if (!ftthToken) {
+    return res.status(401).json({ message: 'رمز مصادقة FTTH مفقود.' });
+  }
+
+  try {
+    // سحب الاشتراكات والعملاء بالتوازي
+    const [subsRes, custRes] = await Promise.all([
+      ftthRequest('/subscriptions', ftthToken, { hierarchyLevel: 0, pageSize: 2000, pageNumber: 1 }),
+      ftthRequest('/customers', ftthToken, { hierarchyLevel: 1, pageSize: 2000, pageNumber: 1 })
+    ]);
+
+    const subscriptions = Array.isArray(subsRes) ? subsRes : (subsRes.items || subsRes.data || []);
+    const customers = Array.isArray(custRes) ? custRes : (custRes.items || custRes.data || []);
+
+    // بناء خريطة سريعة للعملاء للدمج الفوري O(1)
+    const customerMap = new Map();
+    customers.forEach(c => {
+      const id = String(c.id || c.customerId || '');
+      if (id) customerMap.set(id, c);
+    });
+
+    // جلب التعيينات من SQLite
+    const assignments = await dbAll(`
+      SELECT asub.subscription_id, asub.sub_agent_id, sa.name AS agent_name 
+      FROM assigned_subscribers asub
+      JOIN sub_agents sa ON asub.sub_agent_id = sa.id
+    `);
+    const assignMap = new Map();
+    assignments.forEach(a => assignMap.set(String(a.subscription_id), a));
+
+    // دمج وتوحيد الحقول بمرونة عالية
+    let merged = subscriptions.map(sub => {
+      const subId = String(sub.id || sub.subscriptionId || '');
+      const custId = String(sub.customerId || sub.customer?.id || '');
+      const cust = customerMap.get(custId) || sub.customer || {};
+      const assigned = assignMap.get(subId);
+
+      // استخراج البيانات المرنة
+      const fullName = cust.fullName || cust.name || sub.customerName || `${cust.firstName || ''} ${cust.lastName || ''}`.trim() || 'بدون اسم';
+      const phone = cust.phoneNumber || cust.mobile || cust.phone || sub.phoneNumber || 'غير متوفر';
+      const zone = sub.zoneName || sub.zone?.name || cust.zoneName || cust.zone || 'غير محدد';
+      const fat = sub.fatName || sub.fat?.name || sub.splitter || cust.fatName || 'غير محدد';
+      const bundle = sub.bundleName || sub.bundle?.name || sub.planName || sub.profile || 'غير محدد';
+      const status = (sub.status || sub.subscriptionStatus || 'Active').toString();
+      const isOnline = Boolean(sub.isOnline || sub.online || sub.hasActiveSession || sub.sessionStatus === 'Online');
+      const activationDate = sub.activationDate || sub.startDate || sub.createdAt || null;
+      const expirationDate = sub.expirationDate || sub.endDate || sub.expiryDate || null;
+
+      return {
+        id: subId,
+        customerId: custId,
+        username: sub.username || sub.pppoeUsername || subId,
+        fullName,
+        phone,
+        zone,
+        fat,
+        bundle,
+        status,
+        isOnline,
+        activationDate,
+        expirationDate,
+        subAgentId: assigned ? assigned.sub_agent_id : null,
+        subAgentName: assigned ? assigned.agent_name : null,
+        rawCustomer: cust,
+        rawSubscription: sub
+      };
+    });
+
+    // تصفية البيانات إذا كان المستخدم وكيل ثانوي
+    if (subAgentId) {
+      merged = merged.filter(item => String(item.subAgentId) === String(subAgentId));
+    }
+
+    res.json({ total: merged.length, subscribers: merged });
+  } catch (error) {
+    const status = error.response?.status || 500;
+    res.status(status).json({
+      message: status === 401 ? 'انتهت صلاحية جلسة FTTH، يرجى إعادة تسجيل الدخول.' : 'فشل جلب ودمج بيانات المشتركين من المنظومة.',
+      details: error.message
+    });
+  }
+});
+
+// فحص جهاز ONT وقراءة الإشارة
+app.get('/api/ftth/ont', async (req, res) => {
+  const ftthToken = req.headers['x-ftth-token'];
+  const { subscriptionId } = req.query;
+  try {
+    const data = await ftthRequest('/subscriptions/device/ont', ftthToken, { subscriptionId });
+    res.json(data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ message: 'تعذر قراءة بيانات جهاز ONT', details: error.message });
+  }
+});
+
+// تفاصيل الجلسة النشطة (IP, MAC, Uptime)
+app.get('/api/ftth/sessions', async (req, res) => {
+  const ftthToken = req.headers['x-ftth-token'];
+  const { subscriptionId } = req.query;
+  try {
+    const data = await ftthRequest('/sessions', ftthToken, { subscriptionId });
+    res.json(data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ message: 'تعذر جلب الجلسة النشطة', details: error.message });
+  }
+});
+
+// المحفظة والحركات المالية
+app.get('/api/ftth/finance', async (req, res) => {
+  const ftthToken = req.headers['x-ftth-token'];
+  try {
+    const [wallet, transactionsRes] = await Promise.all([
+      ftthRequest('/wallet', ftthToken).catch(() => ({ balance: 0 })),
+      ftthRequest('/transactions', ftthToken, { pageSize: 200, pageNumber: 1 }).catch(() => [])
+    ]);
+
+    const rawTx = Array.isArray(transactionsRes) ? transactionsRes : (transactionsRes.items || transactionsRes.data || []);
+    // استبعاد العمليات الصفرية
+    const filteredTx = rawTx.filter(tx => {
+      const amount = parseFloat(tx.amount ?? tx.value ?? 0);
+      return amount !== 0;
+    });
+
+    res.json({ wallet, transactions: filteredTx });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ message: 'فشل جلب البيانات المالية', details: error.message });
+  }
+});
+
+// تذاكر الدعم الفني ومهام التنصيب
+app.get('/api/ftth/operations', async (req, res) => {
+  const ftthToken = req.headers['x-ftth-token'];
+  try {
+    const [ticketsRes, requestsRes] = await Promise.all([
+      ftthRequest('/support/tickets', ftthToken, { pageSize: 100 }).catch(() => []),
+      ftthRequest('/requests', ftthToken, { pageSize: 100 }).catch(() => [])
+    ]);
+
+    const tickets = Array.isArray(ticketsRes) ? ticketsRes : (ticketsRes.items || ticketsRes.data || []);
+    const requests = Array.isArray(requestsRes) ? requestsRes : (requestsRes.items || requestsRes.data || []);
+
+    res.json({ tickets, requests });
+  } catch (error) {
+    res.status(error.response?.status || 500).json({ message: 'فشل جلب التذاكر والمهام', details: error.message });
+  }
+});
+
+// ==========================================
+// 6. الواجهة الأمامية المتكاملة (HTML5 + Tailwind + Vanilla JS)
+// ==========================================
+const HTML_TEMPLATE = `<!DOCTYPE html>
+<html lang="ar" dir="rtl" class="light">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>إدارة المشتركين وتصدير Excel - مركز وار</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-    <script>
-        tailwind.config = {
-            darkMode: 'class',
-            theme: {
-                extend: {
-                    colors: {
-                        darkBg: '#0f172a',
-                        cardDark: '#1e293b',
-                        lightBg: '#f8fafc',
-                        cardLight: '#ffffff'
-                    }
-                }
-            }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>مركز وار لخدمات الإنترنت | نظام إدارة المشتركين</title>
+  
+  <!-- خط Tajawal العربي -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Tajawal', 'sans-serif'] },
+          colors: {
+            brand: { 50: '#eff6ff', 100: '#dbeafe', 500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8', 900: '#1e3a8a' }
+          }
         }
-    </script>
-    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
-    <style> body { font-family: 'Tajawal', sans-serif; } </style>
+      }
+    }
+  </script>
+
+  <!-- مكتبة SheetJS لتصدير Excel -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
+  <!-- أيقونات Lucide -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    body { font-family: 'Tajawal', sans-serif; }
+    .circular-stat { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
+    .circular-stat:hover { transform: translateY(-4px); }
+    .circular-stat.active-filter { ring-width: 4px; transform: scale(1.04); }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 4px; }
+  </style>
 </head>
-<body class="bg-lightBg text-slate-800 dark:bg-darkBg dark:text-slate-100 min-h-screen flex flex-col">
+<body class="bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-200 min-h-screen">
 
-    <div id="toast-container" class="fixed top-4 left-1/2 transform -translate-x-1/2 z-50 space-y-2 pointer-events-none"></div>
+  <!-- إشعارات Toast -->
+  <div id="toast-container" class="fixed bottom-5 left-5 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none"></div>
 
-    <!-- شاشة تسجيل الدخول -->
-    <div id="login-screen" class="min-h-screen flex items-center justify-center p-4">
-        <div class="bg-cardLight dark:bg-cardDark border border-slate-200 dark:border-slate-700 p-8 rounded-3xl shadow-2xl w-full max-w-md space-y-6">
-            <div class="text-center space-y-2">
-                <div class="w-16 h-16 bg-indigo-600 rounded-2xl mx-auto flex items-center justify-center shadow-lg">
-                    <span class="text-white text-3xl font-black">W</span>
-                </div>
-                <h2 class="text-2xl font-extrabold text-indigo-600 dark:text-indigo-400">مركز وار لخدمات الإنترنت</h2>
-                <p class="text-sm text-slate-500 dark:text-slate-400">سجّل دخولك للوصول إلى قاعدة بيانات المشتركين وتصدير Excel</p>
-            </div>
-            <form id="login-form" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-bold mb-1">اسم المستخدم / البريد</label>
-                    <input type="text" id="ftth-email" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl p-3 text-base focus:outline-none focus:border-indigo-500" required>
-                </div>
-                <div>
-                    <label class="block text-xs font-bold mb-1">كلمة المرور</label>
-                    <input type="password" id="ftth-password" class="w-full bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl p-3 text-base focus:outline-none focus:border-indigo-500" required>
-                </div>
-                <button type="submit" id="login-btn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-3.5 rounded-xl font-bold text-base shadow-lg transition">دخول النظام</button>
-            </form>
-        </div>
+  <!-- شريط التحميل المستمر النابض (Persistent Loading State) -->
+  <div id="persistent-loader" class="hidden fixed top-0 inset-x-0 z-50 bg-brand-600/95 text-white px-4 py-2.5 shadow-lg backdrop-blur-sm animate-pulse">
+    <div class="max-w-7xl mx-auto flex items-center justify-center gap-3 text-sm font-bold">
+      <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+      </svg>
+      <span id="loader-text">جاري سحب ودمج البيانات من منظومة FTTH الأساسية... يرجى الانتظار</span>
     </div>
+  </div>
 
-    <!-- لوحة التحكم وعرض المشتركين -->
-    <div id="dashboard-screen" class="hidden flex-1 flex flex-col">
-        <header class="bg-cardLight dark:bg-cardDark border-b border-slate-200 dark:border-slate-700 sticky top-0 z-40 p-4 flex justify-between items-center shadow-md">
-            <div class="flex items-center gap-3">
-                <div class="w-9 h-9 bg-indigo-600 rounded-xl flex items-center justify-center text-white font-black text-lg">W</div>
-                <div>
-                    <h1 class="text-base font-extrabold">قاعدة بيانات المشتركين (الاسم - الهاتف - الزون - الفات)</h1>
-                </div>
+  <!-- ==========================================
+       شاشة تسجيل الدخول (Login View)
+       ========================================== -->
+  <div id="login-view" class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-slate-100 via-blue-50 to-slate-200 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
+    <div class="w-full max-w-md bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 p-8">
+      <div class="text-center mb-8">
+        <div class="w-16 h-16 bg-brand-600 text-white rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg shadow-brand-500/30">
+          <i data-lucide="wifi" class="w-9 h-9"></i>
+        </div>
+        <h1 class="text-2xl font-extrabold text-slate-900 dark:text-white">مركز وار لخدمات الإنترنت</h1>
+        <p class="text-sm text-slate-500 dark:text-slate-400 mt-1">بوابة إدارة المشتركين والوكلاء المتكاملة (FTTH)</p>
+      </div>
+
+      <!-- تبويب نوع الدخول -->
+      <div class="grid grid-cols-2 gap-2 p-1 bg-slate-100 dark:bg-slate-800 rounded-xl mb-6">
+        <button type="button" onclick="switchLoginRole('admin')" id="tab-role-admin" class="py-2 text-sm font-bold rounded-lg bg-white dark:bg-slate-700 text-brand-600 dark:text-white shadow-sm transition">
+          الوكيل الرئيسي (FTTH)
+        </button>
+        <button type="button" onclick="switchLoginRole('sub')" id="tab-role-sub" class="py-2 text-sm font-bold rounded-lg text-slate-500 dark:text-slate-400 transition">
+          وكيل ثانوي
+        </button>
+      </div>
+
+      <form id="login-form" class="space-y-4">
+        <div>
+          <label class="block text-sm font-bold mb-1.5">اسم المستخدم</label>
+          <input type="text" id="login-username" required placeholder="أدخل اسم المستخدم" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:ring-2 focus:ring-brand-500 outline-none" />
+        </div>
+        <div>
+          <label class="block text-sm font-bold mb-1.5">كلمة المرور</label>
+          <input type="password" id="login-password" required placeholder="••••••••" class="w-full px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 focus:ring-2 focus:ring-brand-500 outline-none" />
+        </div>
+        <div id="sub-master-token-box" class="hidden">
+          <label class="block text-xs font-bold text-amber-600 dark:text-amber-400 mb-1">ملاحظة للوكيل الثانوي:</label>
+          <p class="text-xs text-slate-500 dark:text-slate-400">يتم جلب بيانات مشتركيك المحددين تلقائياً عبر ربط المنظومة.</p>
+        </div>
+        <button type="submit" id="login-btn" class="w-full py-3 bg-brand-600 hover:bg-brand-700 text-white font-bold rounded-xl shadow-lg shadow-brand-500/30 transition flex items-center justify-center gap-2">
+          <span>تسجيل الدخول</span>
+          <i data-lucide="log-in" class="w-4 h-4"></i>
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ==========================================
+       لوحة التحكم الرئيسية (Dashboard View)
+       ========================================== -->
+  <div id="app-view" class="hidden min-h-screen flex flex-col">
+    <!-- الشريط العلوي Navbar -->
+    <header class="sticky top-0 z-30 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 bg-brand-600 text-white rounded-xl flex items-center justify-center font-bold shadow">
+            <i data-lucide="router" class="w-5 h-5"></i>
+          </div>
+          <div>
+            <h1 class="font-extrabold text-base sm:text-lg leading-tight">مركز وار لخدمات الإنترنت</h1>
+            <span id="user-badge" class="text-xs text-brand-600 dark:text-brand-400 font-bold">وكيل رئيسي</span>
+          </div>
+        </div>
+
+        <!-- قائمة التنقل -->
+        <nav class="hidden md:flex items-center gap-1 bg-slate-100 dark:bg-slate-800 p-1 rounded-xl">
+          <button onclick="switchTab('subscribers')" data-tab="subscribers" class="nav-btn px-4 py-1.5 rounded-lg text-sm font-bold bg-white dark:bg-slate-700 text-brand-600 dark:text-white shadow-sm">المشتركين</button>
+          <button onclick="switchTab('agents')" data-tab="agents" id="nav-agents-btn" class="nav-btn px-4 py-1.5 rounded-lg text-sm font-bold text-slate-600 dark:text-slate-300">الوكلاء الثانويين</button>
+          <button onclick="switchTab('finance')" data-tab="finance" id="nav-finance-btn" class="nav-btn px-4 py-1.5 rounded-lg text-sm font-bold text-slate-600 dark:text-slate-300">المحفظة والمالية</button>
+          <button onclick="switchTab('operations')" data-tab="operations" id="nav-ops-btn" class="nav-btn px-4 py-1.5 rounded-lg text-sm font-bold text-slate-600 dark:text-slate-300">الدعم والمهام</button>
+        </nav>
+
+        <div class="flex items-center gap-2">
+          <button onclick="fetchAllData(true)" title="تحديث البيانات" class="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+            <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+          </button>
+          <button onclick="toggleTheme()" title="الوضع الليلي/النهاري" class="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+            <i data-lucide="moon" id="theme-icon" class="w-4 h-4"></i>
+          </button>
+          <button onclick="logout()" title="تسجيل الخروج" class="p-2 rounded-xl bg-red-50 dark:bg-red-950/50 text-red-600 hover:bg-red-100 transition">
+            <i data-lucide="log-out" class="w-4 h-4"></i>
+          </button>
+        </div>
+      </div>
+
+      <!-- قائمة الهاتف المحمول -->
+      <div class="flex md:hidden overflow-x-auto gap-1 px-4 py-2 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-900">
+        <button onclick="switchTab('subscribers')" data-tab="subscribers" class="nav-btn px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap bg-brand-600 text-white">المشتركين</button>
+        <button onclick="switchTab('agents')" data-tab="agents" id="mob-agents-btn" class="nav-btn px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap text-slate-600 dark:text-slate-300">الوكلاء الثانويين</button>
+        <button onclick="switchTab('finance')" data-tab="finance" id="mob-finance-btn" class="nav-btn px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap text-slate-600 dark:text-slate-300">المحفظة والمالية</button>
+        <button onclick="switchTab('operations')" data-tab="operations" id="mob-ops-btn" class="nav-btn px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap text-slate-600 dark:text-slate-300">الدعم والمهام</button>
+      </div>
+    </header>
+
+    <!-- المحتوى الرئيسي -->
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
+
+      <!-- ==========================================
+           القسم 1: المشتركين والإحصائيات الدائرية
+           ========================================== -->
+      <section id="tab-subscribers" class="space-y-6">
+        <!-- الإحصائيات الدائرية التفاعلية -->
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+          <!-- إجمالي المشتركين -->
+          <div onclick="setQuickFilter('all')" id="stat-all" class="circular-stat active-filter cursor-pointer bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col items-center text-center ring-brand-500">
+            <div class="w-16 h-16 rounded-full border-4 border-brand-500 flex items-center justify-center mb-2 bg-brand-50 dark:bg-brand-950/40">
+              <span id="count-all" class="text-lg font-extrabold text-brand-600 dark:text-brand-400">0</span>
+            </div>
+            <span class="text-sm font-bold">إجمالي المشتركين</span>
+          </div>
+
+          <!-- الفعالين -->
+          <div onclick="setQuickFilter('active')" id="stat-active" class="circular-stat cursor-pointer bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col items-center text-center ring-emerald-500">
+            <div class="w-16 h-16 rounded-full border-4 border-emerald-500 flex items-center justify-center mb-2 bg-emerald-50 dark:bg-emerald-950/40">
+              <span id="count-active" class="text-lg font-extrabold text-emerald-600 dark:text-emerald-400">0</span>
+            </div>
+            <span class="text-sm font-bold">الفعالين</span>
+          </div>
+
+          <!-- المتصلين الآن -->
+          <div onclick="setQuickFilter('online')" id="stat-online" class="circular-stat cursor-pointer bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col items-center text-center ring-cyan-500">
+            <div class="w-16 h-16 rounded-full border-4 border-cyan-500 flex items-center justify-center mb-2 bg-cyan-50 dark:bg-cyan-950/40">
+              <span id="count-online" class="text-lg font-extrabold text-cyan-600 dark:text-cyan-400">0</span>
+            </div>
+            <span class="text-sm font-bold">المتصلين الآن</span>
+          </div>
+
+          <!-- غير المتصلين -->
+          <div onclick="setQuickFilter('offline')" id="stat-offline" class="circular-stat cursor-pointer bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col items-center text-center ring-slate-400">
+            <div class="w-16 h-16 rounded-full border-4 border-slate-400 flex items-center justify-center mb-2 bg-slate-100 dark:bg-slate-800">
+              <span id="count-offline" class="text-lg font-extrabold text-slate-600 dark:text-slate-300">0</span>
+            </div>
+            <span class="text-sm font-bold">غير المتصلين</span>
+          </div>
+
+          <!-- المنتهية خلال 7 أيام -->
+          <div onclick="setQuickFilter('expiring7')" id="stat-expiring7" class="circular-stat cursor-pointer bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col items-center text-center ring-amber-500 col-span-2 sm:col-span-1">
+            <div class="w-16 h-16 rounded-full border-4 border-amber-500 flex items-center justify-center mb-2 bg-amber-50 dark:bg-amber-950/40">
+              <span id="count-expiring7" class="text-lg font-extrabold text-amber-600 dark:text-amber-400">0</span>
+            </div>
+            <span class="text-sm font-bold">تنتهي خلال 7 أيام</span>
+          </div>
+        </div>
+
+        <!-- شريط البحث والفرز والتصدير والتحويل -->
+        <div class="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+          <div class="flex flex-col lg:flex-row gap-3 justify-between">
+            <!-- البحث الفوري -->
+            <div class="relative flex-1">
+              <i data-lucide="search" class="w-4 h-4 absolute right-3.5 top-3 text-slate-400"></i>
+              <input type="text" id="search-input" oninput="applyFilters()" placeholder="بحث فوري بالاسم، رقم الهاتف، الزون (Zone)، أو الفات (FAT)..." class="w-full pr-10 pl-4 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm focus:ring-2 focus:ring-brand-500 outline-none" />
+            </div>
+
+            <!-- الفرز -->
+            <div class="flex flex-wrap items-center gap-2">
+              <select id="sort-select" onchange="applyFilters()" class="px-3 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm font-medium outline-none">
+                <option value="name_asc">الفرز: الاسم (أ - ي)</option>
+                <option value="online_first">الفرز: المتصلين أولاً</option>
+                <option value="bundle_asc">الفرز: نوع الباقة</option>
+                <option value="activation_desc">الفرز: تاريخ التفعيل (الأحدث)</option>
+              </select>
+
+              <!-- تصدير Excel -->
+              <button onclick="exportToExcel('filtered')" class="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-bold flex items-center gap-1.5 transition shadow-sm">
+                <i data-lucide="file-spreadsheet" class="w-4 h-4"></i>
+                <span>تصدير المعروض</span>
+              </button>
+              <button onclick="exportToExcel('all')" class="px-3.5 py-2 bg-slate-800 dark:bg-slate-700 hover:bg-slate-700 text-white rounded-xl text-sm font-bold flex items-center gap-1.5 transition shadow-sm">
+                <i data-lucide="download" class="w-4 h-4"></i>
+                <span>تصدير الكل</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- شريط تحويل المشتركين للوكيل الثانوي (يظهر للوكيل الرئيسي عند التحديد) -->
+          <div id="assign-bar" class="hidden pt-3 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3 bg-brand-50/60 dark:bg-brand-950/30 p-3 rounded-xl">
+            <div class="text-sm font-bold text-brand-700 dark:text-brand-300">
+              تم تحديد <span id="selected-count" class="underline">0</span> مشترك
             </div>
             <div class="flex items-center gap-2">
-                <button onclick="exportToExcel()" class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-xl text-xs font-extrabold shadow flex items-center gap-1 transition">
-                    <span>📥 تنزيل Excel</span>
-                </button>
-                <button onclick="logout()" class="bg-rose-500/10 text-rose-500 border border-rose-500/20 px-3.5 py-2 rounded-xl text-xs font-bold">خروج</button>
+              <select id="assign-agent-select" class="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm outline-none">
+                <option value="">-- اختر الوكيل الثانوي --</option>
+              </select>
+              <button onclick="assignSelectedSubscribers()" class="px-4 py-1.5 bg-brand-600 hover:bg-brand-700 text-white rounded-lg text-sm font-bold transition">
+                تحويل المشتركين
+              </button>
             </div>
-        </header>
+          </div>
+        </div>
 
-        <main class="p-4 max-w-6xl mx-auto w-full space-y-4 flex-1">
-            <div class="bg-cardLight dark:bg-cardDark p-4 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm flex flex-col sm:flex-row justify-between items-center gap-3">
-                <div class="w-full sm:flex-1">
-                    <input type="text" id="search-input" oninput="filterSubscribers()" placeholder="🔍 ابحث باسم المشترك، رقم الهاتف، الزون، أو الفات..." class="w-full bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl p-3 text-sm font-semibold focus:outline-none focus:border-indigo-500">
-                </div>
-                <div class="flex items-center gap-2 w-full sm:w-auto justify-between sm:justify-end">
-                    <span id="total-badge" class="bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 px-3.5 py-2 rounded-xl text-xs font-extrabold whitespace-nowrap">العدد: 0</span>
-                    <button onclick="loadSubscribers()" class="bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 px-3.5 py-2 rounded-xl text-xs font-bold transition">تحديث 🔄</button>
-                </div>
+        <!-- جدول المشتركين -->
+        <div class="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-right border-collapse">
+              <thead>
+                <tr class="bg-slate-100 dark:bg-slate-800/80 text-slate-600 dark:text-slate-300 text-xs uppercase border-b border-slate-200 dark:border-slate-700">
+                  <th class="p-3.5 w-10 text-center admin-only-col">
+                    <input type="checkbox" id="select-all-checkbox" onchange="toggleSelectAll(this)" class="rounded border-slate-300" />
+                  </th>
+                  <th class="p-3.5">#</th>
+                  <th class="p-3.5">اسم المشترك</th>
+                  <th class="p-3.5">رقم الهاتف</th>
+                  <th class="p-3.5">الزون (Zone)</th>
+                  <th class="p-3.5">الفات (FAT)</th>
+                  <th class="p-3.5">الباقة</th>
+                  <th class="p-3.5">الحالة والاتصال</th>
+                  <th class="p-3.5 admin-only-col">الوكيل الثانوي</th>
+                  <th class="p-3.5 text-center">التفاصيل</th>
+                </tr>
+              </thead>
+              <tbody id="subscribers-tbody" class="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
+                <tr>
+                  <td colspan="10" class="p-8 text-center text-slate-400">جاري تحميل قائمة المشتركين...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ==========================================
+           القسم 2: صفحة تفاصيل المشترك المستقلة (Modal / View)
+           ========================================== -->
+      <section id="tab-subscriber-detail" class="hidden space-y-6">
+        <div class="flex items-center justify-between">
+          <button onclick="switchTab('subscribers')" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 rounded-xl text-sm font-bold flex items-center gap-2 transition">
+            <i data-lucide="arrow-right" class="w-4 h-4"></i>
+            <span>العودة إلى قائمة المشتركين</span>
+          </button>
+          <span id="detail-sub-id" class="text-xs font-mono bg-slate-200 dark:bg-slate-800 px-3 py-1 rounded-lg"></span>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <!-- البطاقة الشخصية والموقع الجغرافي -->
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+            <div class="flex items-center gap-3 border-b border-slate-100 dark:border-slate-800 pb-4">
+              <div class="w-12 h-12 rounded-2xl bg-brand-100 dark:bg-brand-900/40 text-brand-600 flex items-center justify-center font-extrabold text-xl">
+                <i data-lucide="user" class="w-6 h-6"></i>
+              </div>
+              <div>
+                <h2 id="detail-name" class="text-lg font-extrabold">-</h2>
+                <p id="detail-username" class="text-xs text-slate-500 font-mono">-</p>
+              </div>
             </div>
 
-            <div class="bg-cardLight dark:bg-cardDark rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm overflow-hidden">
-                <div class="overflow-x-auto">
-                    <table class="w-full text-right text-sm">
-                        <thead class="bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-300 font-bold border-b border-slate-200 dark:border-slate-700">
-                            <tr>
-                                <th class="p-4">#</th>
-                                <th class="p-4">اسم المشترك</th>
-                                <th class="p-4">رقم الهاتف</th>
-                                <th class="p-4">الزون (Zone)</th>
-                                <th class="p-4">الفات (FAT)</th>
-                            </tr>
-                        </thead>
-                        <tbody id="subscribers-tbody" class="divide-y divide-slate-200 dark:divide-slate-700/60 font-medium">
-                            <tr><td colspan="5" class="p-12 text-center text-indigo-500 font-bold animate-pulse text-base">⏳ جاري سحب وتحميل بيانات المشتركين من المنظومة... يرجى الانتظار لحين الاكتمال</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+            <div class="space-y-2.5 text-sm">
+              <div class="flex justify-between"><span class="text-slate-500">رقم الهاتف:</span><span id="detail-phone" class="font-bold">-</span></div>
+              <div class="flex justify-between"><span class="text-slate-500">المنطقة (Zone):</span><span id="detail-zone" class="font-bold">-</span></div>
+              <div class="flex justify-between"><span class="text-slate-500">نقطة التوزيع (FAT):</span><span id="detail-fat" class="font-bold">-</span></div>
+              <div class="flex justify-between"><span class="text-slate-500">الباقة الحالية:</span><span id="detail-bundle" class="font-bold text-brand-600">-</span></div>
+              <div class="flex justify-between"><span class="text-slate-500">تاريخ التفعيل:</span><span id="detail-activation" class="font-bold">-</span></div>
+              <div class="flex justify-between"><span class="text-slate-500">تاريخ الانتهاء:</span><span id="detail-expiration" class="font-bold">-</span></div>
             </div>
-        </main>
-    </div>
 
-    <script>
-        let authToken = localStorage.getItem('ftth_token') || '';
-        let allSubscribers = [];
-        let filteredSubscribers = [];
+            <div id="detail-map-box" class="pt-3 border-t border-slate-100 dark:border-slate-800">
+              <a id="detail-maps-link" href="#" target="_blank" class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition">
+                <i data-lucide="map-pin" class="w-4 h-4"></i>
+                <span>فتح الموقع على خرائط جوجل</span>
+              </a>
+            </div>
+          </div>
 
-        window.addEventListener('DOMContentLoaded', () => {
-            if (authToken) {
-                document.getElementById('login-screen').classList.add('hidden');
-                document.getElementById('dashboard-screen').classList.remove('hidden');
-                loadSubscribers();
-            }
-        });
+          <!-- فحص جهاز ONT وقراءة الإشارة -->
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-4">
+              <h3 class="font-extrabold text-base flex items-center gap-2">
+                <i data-lucide="activity" class="w-5 h-5 text-cyan-500"></i>
+                <span>فحص جهاز ONT والإشارة</span>
+              </h3>
+              <button onclick="reloadOntAndSession()" class="text-xs text-brand-600 font-bold hover:underline">تحديث الفحص</button>
+            </div>
 
-        function showToast(message, type = 'info') {
-            const container = document.getElementById('toast-container');
-            const toast = document.createElement('div');
-            toast.className = \`pointer-events-auto px-4 py-3 rounded-xl shadow-2xl text-xs font-extrabold text-white transition-all duration-300 \${type === 'error' ? 'bg-rose-600' : 'bg-indigo-600'}\`;
-            toast.innerText = message;
-            container.appendChild(toast);
-            setTimeout(() => toast.remove(), 3500);
-        }
+            <div id="ont-data-container" class="space-y-3 text-sm">
+              <div class="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 text-center text-slate-400 animate-pulse">
+                جاري فحص الجهاز وقراءة Rx Power...
+              </div>
+            </div>
+          </div>
 
-        function extractVal(field) {
-            if (!field && field !== 0) return '';
-            if (typeof field === 'object') {
-                return field.displayValue || field.name || field.title || field.code || field.id || '';
-            }
-            return String(field);
-        }
+          <!-- تفاصيل الجلسة النشطة (IP, MAC, Uptime) -->
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
+            <div class="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-4">
+              <h3 class="font-extrabold text-base flex items-center gap-2">
+                <i data-lucide="globe" class="w-5 h-5 text-emerald-500"></i>
+                <span>تفاصيل الجلسة النشطة</span>
+              </h3>
+            </div>
 
-        document.getElementById('login-form').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const btn = document.getElementById('login-btn');
-            btn.innerText = 'جاري التحقق...';
-            btn.disabled = true;
+            <div id="session-data-container" class="space-y-3 text-sm">
+              <div class="p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 text-center text-slate-400 animate-pulse">
+                جاري جلب بيانات الجلسة (IP / MAC)...
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
 
-            try {
-                const res = await fetch('/api/ftth/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        username: document.getElementById('ftth-email').value,
-                        password: document.getElementById('ftth-password').value
-                    })
-                });
-                const data = await res.json();
-                const rawToken = data.access_token || data.token || data.accessToken || (typeof data === 'string' ? data : null);
+      <!-- ==========================================
+           القسم 3: إدارة الوكلاء الثانويين (Sub-Agents)
+           ========================================== -->
+      <section id="tab-agents" class="hidden space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <!-- نموذج إضافة وكيل ثانوي -->
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm h-fit">
+            <h2 class="text-lg font-extrabold mb-4 flex items-center gap-2">
+              <i data-lucide="user-plus" class="w-5 h-5 text-brand-600"></i>
+              <span>إضافة وكيل ثانوي جديد</span>
+            </h2>
+            <form id="add-agent-form" class="space-y-3.5">
+              <div>
+                <label class="block text-xs font-bold mb-1">اسم الوكيل / النقطة</label>
+                <input type="text" id="agent-name" required placeholder="مثال: مكتب النور للإنترنت" class="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm outline-none" />
+              </div>
+              <div>
+                <label class="block text-xs font-bold mb-1">اسم المستخدم للدخول</label>
+                <input type="text" id="agent-username" required placeholder="noor_agent" class="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm outline-none" />
+              </div>
+              <div>
+                <label class="block text-xs font-bold mb-1">كلمة المرور</label>
+                <input type="password" id="agent-password" required placeholder="••••••••" class="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm outline-none" />
+              </div>
+              <div>
+                <label class="block text-xs font-bold mb-1">رقم الهاتف</label>
+                <input type="text" id="agent-phone" placeholder="07800000000" class="w-full px-3.5 py-2 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm outline-none" />
+              </div>
+              <button type="submit" class="w-full py-2.5 bg-brand-600 hover:bg-brand-700 text-white font-bold rounded-xl text-sm transition">
+                إنشاء حساب الوكيل
+              </button>
+            </form>
+          </div>
 
-                if (res.ok && rawToken) {
-                    authToken = rawToken.startsWith('Bearer ') ? rawToken : \`Bearer \${rawToken}\`;
-                    localStorage.setItem('ftth_token', authToken);
-                    document.getElementById('login-screen').classList.add('hidden');
-                    document.getElementById('dashboard-screen').classList.remove('hidden');
-                    loadSubscribers();
-                } else {
-                    showToast(data.message || "فشل تسجيل الدخول", "error");
-                    btn.innerText = 'دخول النظام';
-                    btn.disabled = false;
-                }
-            } catch (err) {
-                showToast("خطأ في الاتصال بالخادم", "error");
-                btn.innerText = 'دخول النظام';
-                btn.disabled = false;
-            }
-        });
+          <!-- قائمة الوكلاء الثانويين -->
+          <div class="lg:col-span-2 bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+            <h2 class="text-lg font-extrabold mb-4">الوكلاء الثانويين المعتمدين</h2>
+            <div class="overflow-x-auto">
+              <table class="w-full text-right text-sm">
+                <thead>
+                  <tr class="bg-slate-100 dark:bg-slate-800 text-xs border-b border-slate-200 dark:border-slate-700">
+                    <th class="p-3">اسم الوكيل</th>
+                    <th class="p-3">اسم المستخدم</th>
+                    <th class="p-3">الهاتف</th>
+                    <th class="p-3 text-center">عدد المشتركين</th>
+                    <th class="p-3 text-center">إجراء</th>
+                  </tr>
+                </thead>
+                <tbody id="agents-tbody" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
 
-        async function loadSubscribers() {
-            const tbody = document.getElementById('subscribers-tbody');
-            // استمرار إظهار شاشة التحميل لحين الاكتمال التام
-            tbody.innerHTML = '<tr><td colspan="5" class="p-12 text-center text-indigo-500 font-bold animate-pulse text-base">⏳ جاري سحب وتحميل بيانات المشتركين من المنظومة... يرجى الانتظار لحين الاكتمال</td></tr>';
+      <!-- ==========================================
+           القسم 4: المحفظة والحركات المالية
+           ========================================== -->
+      <section id="tab-finance" class="hidden space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div class="bg-gradient-to-l from-brand-600 to-brand-800 text-white p-6 rounded-2xl shadow-lg">
+            <span class="text-xs opacity-80 font-bold">رصيد المحفظة الحالي</span>
+            <div id="wallet-balance" class="text-3xl font-extrabold mt-2">0 IQD</div>
+          </div>
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+            <span class="text-xs text-slate-500 font-bold">دفعات المشتركين (Card)</span>
+            <div id="card-payments-count" class="text-2xl font-extrabold text-emerald-600 mt-2">0 عملية</div>
+          </div>
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+            <span class="text-xs text-slate-500 font-bold">دفعات الوكيل (Wallet)</span>
+            <div id="wallet-payments-count" class="text-2xl font-extrabold text-amber-600 mt-2">0 عملية</div>
+          </div>
+        </div>
 
-            try {
-                const res = await fetch('/api/ftth/subscribers-all', {
-                    headers: { 'Authorization': authToken }
-                });
+        <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+          <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <h3 class="font-extrabold text-lg">سجل الحركات المالية (مستبعدة العمليات الصفرية)</h3>
+            <select id="payment-mode-filter" onchange="renderTransactions()" class="px-3 py-1.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm">
+              <option value="all">جميع طرق الدفع</option>
+              <option value="Card">دفع المشترك (Card)</option>
+              <option value="Wallet">دفع الوكيل (Wallet)</option>
+            </select>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-right text-sm">
+              <thead>
+                <tr class="bg-slate-100 dark:bg-slate-800 text-xs">
+                  <th class="p-3">التاريخ</th>
+                  <th class="p-3">التفاصيل / المشترك</th>
+                  <th class="p-3">طريقة الدفع (paymentMode)</th>
+                  <th class="p-3">المبلغ</th>
+                </tr>
+              </thead>
+              <tbody id="transactions-tbody" class="divide-y divide-slate-100 dark:divide-slate-800"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
 
-                if (res.status === 401) {
-                    showToast("انتهت الجلسة، يرجى إعادة تسجيل الدخول", "error");
-                    logout();
-                    return;
-                }
+      <!-- ==========================================
+           القسم 5: الدعم الفني ومهام التنصيب
+           ========================================== -->
+      <section id="tab-operations" class="hidden space-y-6">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <!-- تذاكر الدعم الفني -->
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+            <h3 class="font-extrabold text-lg mb-4 flex items-center gap-2">
+              <i data-lucide="life-buoy" class="w-5 h-5 text-red-500"></i>
+              <span>تذاكر الدعم الفني</span>
+            </h3>
+            <div id="tickets-list" class="space-y-3"></div>
+          </div>
 
-                if (!res.ok) throw new Error('فشل الجلب من الخادم');
+          <!-- مهام التنصيب -->
+          <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
+            <h3 class="font-extrabold text-lg mb-4 flex items-center gap-2">
+              <i data-lucide="wrench" class="w-5 h-5 text-brand-600"></i>
+              <span>مهام التنصيب والطلبات</span>
+            </h3>
+            <div id="requests-list" class="space-y-3"></div>
+          </div>
+        </div>
+      </section>
 
-                const data = await res.json();
-                
-                if (!Array.isArray(data) || data.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-amber-500 font-bold">لا توجد بيانات متاحة حالياً أو أن الحساب لا يملك مشتركين مسجلين.</td></tr>';
-                    return;
-                }
+    </main>
+  </div>
 
-                allSubscribers = data.map(sub => {
-                    const name = extractVal(sub.customer) || extractVal(sub.subscriber) || 'غير محدد';
-                    const phone = sub.phone || sub.mobile || sub.customer?.phone || sub.customer?.mobile || 'غير مسجل';
-                    const zone = extractVal(sub.zone) || extractVal(sub.deviceDetails?.zone) || 'غير محدد';
-                    const fat = extractVal(sub.fat) || extractVal(sub.deviceDetails?.fat) || 'غير محدد';
-                    
-                    return { name, phone, zone, fat };
-                });
+  <!-- ==========================================
+       منطق الواجهة الأمامية (Vanilla JS)
+       ========================================== -->
+  <script>
+    // حالة التطبيق العامة
+    const state = {
+      token: localStorage.getItem('war_ftth_token') || '',
+      role: localStorage.getItem('war_user_role') || 'admin',
+      subAgentId: localStorage.getItem('war_sub_agent_id') || '',
+      username: localStorage.getItem('war_username') || '',
+      loginRoleMode: 'admin',
+      allSubscribers: [],
+      filteredSubscribers: [],
+      selectedIds: new Set(),
+      quickFilter: 'all',
+      subAgents: [],
+      transactions: [],
+      currentDetailSub: null
+    };
 
-                filteredSubscribers = [...allSubscribers];
-                renderTable(filteredSubscribers);
-                showToast(\`تم تحميل \${allSubscribers.length} مشترك بنجاح\`);
-            } catch (err) {
-                tbody.innerHTML = '<tr><td colspan="5" class="p-12 text-center text-rose-500 font-bold text-base">❌ تعذر جلب البيانات من المنظومة. يرجى إعادة المحاولة أو تسجيل الدخول من جديد.</td></tr>';
-                showToast("تعذر جلب البيانات", "error");
-            }
-        }
+    // تهيئة الأيقونات والثيم عند التحميل
+    document.addEventListener('DOMContentLoaded', () => {
+      lucide.createIcons();
+      initTheme();
+      if (state.token) {
+        showDashboard();
+      } else {
+        showLogin();
+      }
+    });
 
-        function renderTable(list) {
-            const tbody = document.getElementById('subscribers-tbody');
-            const badge = document.getElementById('total-badge');
-            badge.innerText = \`العدد: \${list.length} / الكلي: \${allSubscribers.length}\`;
-            tbody.innerHTML = '';
-
-            if (list.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="p-8 text-center text-slate-400 font-bold">لا توجد نتائج مطابقة للبحث</td></tr>';
-                return;
-            }
-
-            list.forEach((item, index) => {
-                tbody.innerHTML += \`
-                    <tr class="hover:bg-slate-100 dark:hover:bg-slate-800/60 transition">
-                        <td class="p-4 text-xs text-slate-400 font-mono">\${index + 1}</td>
-                        <td class="p-4 font-bold text-indigo-600 dark:text-indigo-400">\${item.name}</td>
-                        <td class="p-4 font-mono dir-ltr text-right">
-                            \${item.phone !== 'غير مسجل' ? \`<a href="tel:\${item.phone}" class="text-emerald-500 font-bold hover:underline">\${item.phone}</a>\` : '<span class="text-slate-400 text-xs">غير مسجل</span>'}
-                        </td>
-                        <td class="p-4 font-bold text-slate-700 dark:text-slate-200">\${item.zone}</td>
-                        <td class="p-4 font-mono font-bold text-amber-600 dark:text-amber-400">\${item.fat}</td>
-                    </tr>
-                \`;
-            });
-        }
-
-        function filterSubscribers() {
-            const q = document.getElementById('search-input').value.trim().toLowerCase();
-            if (!q) {
-                filteredSubscribers = [...allSubscribers];
-            } else {
-                filteredSubscribers = allSubscribers.filter(s => 
-                    s.name.toLowerCase().includes(q) ||
-                    s.phone.toLowerCase().includes(q) ||
-                    s.zone.toLowerCase().includes(q) ||
-                    s.fat.toLowerCase().includes(q)
-                );
-            }
-            renderTable(filteredSubscribers);
-        }
-
-        function exportToExcel() {
-            if (filteredSubscribers.length === 0) return;
-            const excelData = filteredSubscribers.map((item, idx) => ({
-                'التسلسل': idx + 1,
-                'اسم المشترك': item.name,
-                'رقم الهاتف': item.phone,
-                'الزون (Zone)': item.zone,
-                'الفات (FAT)': item.fat
-            }));
-
-            const worksheet = XLSX.utils.json_to_sheet(excelData);
-            worksheet['!cols'] = [{ wch: 8 }, { wch: 35 }, { wch: 18 }, { wch: 18 }, { wch: 18 }];
-            const workbook = XLSX.utils.book_new();
-            XLSX.utils.book_append_sheet(workbook, worksheet, 'المشتركين');
-            XLSX.writeFile(workbook, 'سجل_المشتركين.xlsx');
-            showToast("تم تنزيل ملف Excel بنجاح!");
-        }
-
-        function logout() {
-            localStorage.removeItem('ftth_token');
-            location.reload();
-        }
-    </script>
-</body>
-</html>`);
-});
-
-// مسار فحص الصحة للإيقاظ (Keep-Alive)
-app.get('/ping', (req, res) => {
-    res.status(200).send('Server is alive!');
-});
-
-// مسار تسجيل الدخول
-app.post('/api/ftth/login', async (req, res) => {
-    const { username, password } = req.body;
-    try {
-        const params = new URLSearchParams();
-        params.append('grant_type', 'password');
-        params.append('client_id', 'earthlink-portals');
-        params.append('username', username);
-        params.append('password', password);
-
-        const response = await axios.post('https://admin.ftth.iq/api/auth/Contractor/token', params, {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }
-        });
-        res.json(response.data);
-    } catch (error) {
-        res.status(401).json({ message: "فشل تسجيل الدخول" });
+    // إدارة الوضع الليلي والنهاري
+    function initTheme() {
+      const savedTheme = localStorage.getItem('war_theme') || 'light';
+      document.documentElement.classList.toggle('dark', savedTheme === 'dark');
     }
-});
 
-// مسار جلب المشتركين الكلي ودمج الهواتف
-app.get('/api/ftth/subscribers-all', async (req, res) => {
-    const token = req.headers.authorization;
-    if (!token) return res.status(401).json({ error: "غير مرخص" });
-
-    try {
-        const headers = { 'Authorization': token, 'Accept': 'application/json' };
-        
-        const [subsRes, custsRes] = await Promise.all([
-            axios.get('https://admin.ftth.iq/api/subscriptions?hierarchyLevel=0&pageSize=3000', { headers }),
-            axios.get('https://admin.ftth.iq/api/customers?hierarchyLevel=1&pageSize=3000', { headers }).catch(() => ({ data: { items: [] } }))
-        ]);
-
-        const subs = Array.isArray(subsRes.data) ? subsRes.data : (subsRes.data.items || subsRes.data.data || []);
-        const custs = Array.isArray(custsRes.data) ? custsRes.data : (custsRes.data.items || custsRes.data.data || []);
-
-        const phoneMap = {};
-        custs.forEach(c => {
-            const id = c.id || c.customerId;
-            const phone = c.primaryContact?.mobile || c.mobile || c.phone || c.contact?.mobile;
-            if (id && phone) phoneMap[String(id)] = phone;
-        });
-
-        const enrichedSubs = subs.map(sub => {
-            const custId = sub.customerId || (typeof sub.customer === 'object' ? sub.customer?.id : null);
-            const foundPhone = (custId && phoneMap[String(custId)]) || sub.phone || sub.mobile || sub.customer?.phone || sub.customer?.mobile;
-            return {
-                ...sub,
-                phone: foundPhone || 'غير مسجل'
-            };
-        });
-
-        res.json(enrichedSubs);
-    } catch (error) {
-        res.status(500).json({ error: "تعذر جلب بيانات المشتركين" });
+    function toggleTheme() {
+      const isDark = document.documentElement.classList.toggle('dark');
+      localStorage.setItem('war_theme', isDark ? 'dark' : 'light');
+      showToast(isDark ? 'تم تفعيل الوضع الليلي' : 'تم تفعيل الوضع النهاري', 'info');
     }
-});
 
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-    console.log(`🚀 السيرفر يعمل على Port ${PORT}`);
-    
-    // كود عدم النوم (Keep-Alive)
-    const INTERVAL_TIME = 10 * 60 * 1000; 
-    setInterval(() => {
-        const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-        axios.get(`${RENDER_URL}/ping`).catch(() => {});
-    }, INTERVAL_TIME);
-});
+    // إشعارات Toast احترافية
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toast-container');
+      const colors = {
+        success: 'bg-emerald-600 text-white',
+        error: 'bg-red-600 text-white',
+        info: 'bg-slate-800 text-white dark:bg-brand-600'
+      };
+      const toast = document.createElement('div');
+      toast.className = \`\${colors[type] || colors.info} px-4 py-3 rounded-xl shadow-xl text-sm font-bold flex items-center justify-between gap-3 pointer-events-auto transform transition-all duration-300\`;
+      toast.innerHTML = \`<span>\${message}</span>\`;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+      }, 3500);
+    }
+
+    // التحكم بمؤشر التحميل المستمر النابض
+    function setLoading(isLoading, text = 'جاري سحب ودمج البيانات من منظومة FTTH الأساسية...') {
+      const loader = document.getElementById('persistent-loader');
+      document.getElementById('loader-text').textContent = text;
+      loader.classList.toggle('hidden', !isLoading);
+    }
+
+    // تبديل نوع الدخول (رئيسي / ثانوي)
+    function switchLoginRole(mode) {
+      state.loginRoleMode = mode;
+      const adminTab = document.getElementById('tab-role-admin');
+      const subTab = document.getElementById('tab-role-sub');
+      const subNote = document.getElementById('sub-master-token-box');
+
+      if (mode === 'admin') {
+        adminTab.className = 'py-2 text-sm font-bold rounded-lg bg-white dark:bg-slate-700 text-brand-600 dark:text-white shadow-sm transition';
+        subTab.className = 'py-2 text-sm font-bold rounded-lg text-slate-500 dark:text-slate-400 transition';
+        subNote.classList.add('hidden');
+      } else {
+        subTab.className = 'py-2 text-sm font-bold rounded-lg bg-white dark:bg-slate-700 text-brand-600 dark:text-white shadow-sm transition';
+        adminTab.className = 'py-2 text-sm font-bold rounded-lg text-slate-500 dark:text-slate-400 transition';
+        subNote.classList.remove('hidden');
+      }
+    }
+
+    // معالجة تسجيل الدخول
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const username = document.getElementById('login-username').value.trim();
+      const password = document.getElementById('login-password').value;
+      const btn = document.getElementById('login-btn');
+      btn.disabled = true;
+
+      try {
+        if (state.loginRoleMode === 'admin') {
+          const res = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.message || 'فشل تسجيل الدخول');
+
+          localStorage.setItem('war_ftth_token', data.token);
+          localStorage.setItem('war_master_ftth_token', data.token);
+          localStorage.setItem('war_user_role', 'admin');
+          localStorage.setItem('war_username', username);
+          localStorage.removeItem('war_sub_agent_id');
+
+          state.token = data.token;
+          state.role = 'admin';
+          state.username = username;
+          state.subAgentId = '';
+        } else {
+          // دخول وكيل ثانوي
+          const masterToken = localStorage.getItem('war_master_ftth_token');
+          if (!masterToken) {
+            throw new Error('يجب تسجيل دخول الوكيل الرئيسي مرة واحدة على هذا المتصفح لربط جلسة FTTH.');
+          }
+          const res = await fetch('/api/auth/sub-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.message || 'فشل دخول الوكيل الثانوي');
+
+          localStorage.setItem('war_ftth_token', masterToken);
+          localStorage.setItem('war_user_role', 'sub_agent');
+          localStorage.setItem('war_sub_agent_id', data.agent.id);
+          localStorage.setItem('war_username', data.agent.name);
+
+          state.token = masterToken;
+          state.role = 'sub_agent';
+          state.subAgentId = data.agent.id;
+          state.username = data.agent.name;
+        }
+
+        showToast('تم تسجيل الدخول بنجاح!', 'success');
+        showDashboard();
+      } catch (err) {
+        showToast(err.message, 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    function logout() {
+      localStorage.removeItem('war_ftth_token');
+      localStorage.removeItem('war_user_role');
+      localStorage.removeItem('war_sub_agent_id');
+      state.token = '';
+      showLogin();
+      showToast('تم تسجيل الخروج', 'info');
+    }
+
+    function showLogin() {
+      document.getElementById('login-view').classList.remove('hidden');
+      document.getElementById('app-view').classList.add('hidden');
+    }
+
+    function showDashboard() {
+      document.getElementById('login-view').classList.add('hidden');
+      document.getElementById('app-view').classList.remove('hidden');
+
+      const badge = document.getElementById('user-badge');
+      const isAdmin = state.role === 'admin';
+      badge.textContent = isAdmin ? \`وكيل رئيسي (\${state.username})\` : \`وكيل ثانوي: \${state.username}\`;
+
+      // إخفاء تبويبات الإدارة عن الوكيل الثانوي
+      ['nav-agents-btn', 'nav-finance-btn', 'nav-ops-btn', 'mob-agents-btn', 'mob-finance-btn', 'mob-ops-btn'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('hidden', !isAdmin);
+      });
+
+      fetchAllData();
+    }
+
+    // التنقل بين الأقسام
+    function switchTab(tabName) {
+      ['subscribers', 'subscriber-detail', 'agents', 'finance', 'operations'].forEach(t => {
+        document.getElementById(\`tab-\${t}\`).classList.add('hidden');
+      });
+      document.getElementById(\`tab-\${tabName}\`).classList.remove('hidden');
+
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        const isMatch = btn.dataset.tab === tabName;
+        btn.className = isMatch
+          ? 'nav-btn px-4 py-1.5 rounded-lg text-sm font-bold bg-white dark:bg-slate-700 text-brand-600 dark:text-white shadow-sm'
+          : 'nav-btn px-4 py-1.5 rounded-lg text-sm font-bold text-slate-600 dark:text-slate-300';
+      });
+    }
+
+    // جلب كافة البيانات من الخادم
+    async function fetchAllData(notify = false) {
+      setLoading(true, 'جاري سحب ودمج بيانات المشتركين والوكلاء من منظومة FTTH...');
+      try {
+        const headers = { 'x-ftth-token': state.token };
+        if (state.role === 'sub_agent' && state.subAgentId) {
+          headers['x-sub-agent-id'] = state.subAgentId;
+        }
+
+        const subRes = await fetch('/api/ftth/merged-subscribers', { headers });
+        if (subRes.status === 401) {
+          showToast('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً', 'error');
+          logout();
+          return;
+        }
+        const subData = await subRes.json();
+        if (!subRes.ok) throw new Error(subData.message);
+
+        state.allSubscribers = subData.subscribers || [];
+        updateStats();
+        applyFilters();
+
+        if (state.role === 'admin') {
+          await Promise.all([loadSubAgents(), loadFinance(), loadOperations()]);
+        }
+
+        if (notify) showToast('تم تحديث جميع البيانات بنجاح', 'success');
+      } catch (err) {
+        showToast(err.message || 'حدث خطأ أثناء جلب البيانات', 'error');
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    // حساب الإحصائيات الدائرية
+    function updateStats() {
+      const now = new Date();
+      const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+      let active = 0, online = 0, offline = 0, expiring7 = 0;
+
+      state.allSubscribers.forEach(s => {
+        const isAct = s.status.toLowerCase() === 'active';
+        if (isAct) active++;
+        if (s.isOnline) online++;
+        else offline++;
+
+        if (s.expirationDate) {
+          const exp = new Date(s.expirationDate);
+          if (exp >= now && exp <= sevenDaysLater) expiring7++;
+        }
+      });
+
+      document.getElementById('count-all').textContent = state.allSubscribers.length;
+      document.getElementById('count-active').textContent = active;
+      document.getElementById('count-online').textContent = online;
+      document.getElementById('count-offline').textContent = offline;
+      document.getElementById('count-expiring7').textContent = expiring7;
+    }
+
+    // التصفية السريعة بالنقر على الدوائر
+    function setQuickFilter(filterKey) {
+      state.quickFilter = filterKey;
+      document.querySelectorAll('.circular-stat').forEach(el => el.classList.remove('active-filter'));
+      document.getElementById(\`stat-\${filterKey}\`).classList.add('active-filter');
+      applyFilters();
+    }
+
+    // تطبيق البحث والفلترة والفرز
+    function applyFilters() {
+      const query = document.getElementById('search-input').value.trim().toLowerCase();
+      const sortBy = document.getElementById('sort-select').value;
+      const now = new Date();
+      const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+      let list = state.allSubscribers.filter(s => {
+        // فلتر الدوائر
+        if (state.quickFilter === 'active' && s.status.toLowerCase() !== 'active') return false;
+        if (state.quickFilter === 'online' && !s.isOnline) return false;
+        if (state.quickFilter === 'offline' && s.isOnline) return false;
+        if (state.quickFilter === 'expiring7') {
+          if (!s.expirationDate) return false;
+          const exp = new Date(s.expirationDate);
+          if (!(exp >= now && exp <= sevenDaysLater)) return false;
+        }
+
+        // البحث الفوري
+        if (query) {
+          const hay = \`\${s.fullName} \${s.phone} \${s.zone} \${s.fat} \${s.username}\`.toLowerCase();
+          if (!hay.includes(query)) return false;
+        }
+        return true;
+      });
+
+      // الفرز
+      list.sort((a, b) => {
+        if (sortBy === 'name_asc') return a.fullName.localeCompare(b.fullName, 'ar');
+        if (sortBy === 'online_first') return (b.isOnline ? 1 : 0) - (a.isOnline ? 1 : 0);
+        if (sortBy === 'bundle_asc') return a.bundle.localeCompare(b.bundle, 'ar');
+        if (sortBy === 'activation_desc') return new Date(b.activationDate || 0) - new Date(a.activationDate || 0);
+        return 0;
+      });
+
+      state.filteredSubscribers = list;
+      renderSubscribersTable();
+    }
+
+    // رسم جدول المشتركين
+    function renderSubscribersTable() {
+      const tbody = document.getElementById('subscribers-tbody');
+      const isAdmin = state.role === 'admin';
+
+      document.querySelectorAll('.admin-only-col').forEach(el => el.classList.toggle('hidden', !isAdmin));
+
+      if (state.filteredSubscribers.length === 0) {
+        tbody.innerHTML = \`<tr><td colspan="10" class="p-8 text-center text-slate-400 font-bold">لا توجد نتائج مطابقة للبحث أو التصفية الحالية.</td></tr>\`;
+        return;
+      }
+
+      tbody.innerHTML = state.filteredSubscribers.map((s, idx) => {
+        const isChecked = state.selectedIds.has
