@@ -1,15 +1,14 @@
-FROM node:20-alpine
-
-# تثبيت أدوات البناء اللازمة لمكتبة sqlite3 على بيئة Alpine
-RUN apk add --no-cache python3 make g++
+FROM node:20-slim
 
 WORKDIR /app
 
-# نسخ ملفات الحزم وتثبيتها
+# نسخ ملفات الحزم أولاً
 COPY package*.json ./
+
+# تثبيت الحزم (بما فيها أدوات البناء التلقائية لـ sqlite3)
 RUN npm install --production
 
-# نسخ كود التطبيق
+# نسخ باقي ملفات المشروع
 COPY . .
 
 # فتح المنفذ الافتراضي لـ Render
