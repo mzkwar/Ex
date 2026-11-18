@@ -103,7 +103,8 @@ app.post('/api/auth/login', async (req, res) => {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json'
-      }
+      },
+      timeout: 30000
     });
 
     const data = response.data;
@@ -122,7 +123,7 @@ app.post('/api/auth/login', async (req, res) => {
   } catch (error) {
     const status = error.response?.status || 500;
     const msg = error.response?.data?.error_description || error.response?.data?.message || 'فشل تسجيل الدخول. تأكد من اسم المستخدم وكلمة المرور.';
-    res.status(status).json({ message: msg });
+    res.status(status).json({ message: `${msg} (رمز الاستجابة: ${status})` });
   }
 });
 
@@ -233,7 +234,7 @@ app.post('/api/admin/assign', async (req, res) => {
 });
 
 // ==========================================
-// 5. تكامل FTTH APIs
+// 5. تكامل FTTH APIs (مهلة 60 ثانية + إرجاع رمز الاستجابة الدقيق)
 // ==========================================
 async function ftthRequest(endpoint, token, params = {}) {
   const cleanToken = token.replace(/^Bearer\s+/i, '');
@@ -243,7 +244,7 @@ async function ftthRequest(endpoint, token, params = {}) {
       'Authorization': `Bearer ${cleanToken}`,
       'Accept': 'application/json'
     },
-    timeout: 25000
+    timeout: 60000 // 60 ثانية لتحمل سحب الآلاف من السجلات
   });
   return response.data;
 }
@@ -253,7 +254,7 @@ app.get('/api/ftth/merged-subscribers', async (req, res) => {
   const subAgentId = req.headers['x-sub-agent-id'];
 
   if (!ftthToken) {
-    return res.status(401).json({ message: 'رمز مصادقة FTTH مفقود.' });
+    return res.status(401).json({ statusCode: 401, message: 'رمز مصادقة FTTH مفقود (401).' });
   }
 
   try {
@@ -321,10 +322,14 @@ app.get('/api/ftth/merged-subscribers', async (req, res) => {
 
     res.json({ total: merged.length, subscribers: merged });
   } catch (error) {
-    const status = error.response?.status || 500;
+    const status = error.response?.status || (error.code === 'ECONNABORTED' ? 504 : 500);
+    const remoteMsg = error.response?.data?.message || error.response?.data?.error_description || error.message;
     res.status(status).json({
-      message: status === 401 ? 'انتهت صلاحية جلسة FTTH، يرجى إعادة تسجيل الدخول.' : 'فشل جلب ودمج بيانات المشتركين من المنظومة.',
-      details: error.message
+      statusCode: status,
+      message: status === 401
+        ? `انتهت صلاحية جلسة FTTH (رمز الاستجابة: 401)`
+        : `فشل سحب المشتركين من المنظومة [رمز الاستجابة: ${status}] - ${remoteMsg}`,
+      details: remoteMsg
     });
   }
 });
@@ -336,7 +341,8 @@ app.get('/api/ftth/ont', async (req, res) => {
     const data = await ftthRequest('/subscriptions/device/ont', ftthToken, { subscriptionId });
     res.json(data);
   } catch (error) {
-    res.status(error.response?.status || 500).json({ message: 'تعذر قراءة بيانات جهاز ONT', details: error.message });
+    const status = error.response?.status || 500;
+    res.status(status).json({ statusCode: status, message: `تعذر قراءة بيانات جهاز ONT (رمز: ${status})`, details: error.message });
   }
 });
 
@@ -347,7 +353,8 @@ app.get('/api/ftth/sessions', async (req, res) => {
     const data = await ftthRequest('/sessions', ftthToken, { subscriptionId });
     res.json(data);
   } catch (error) {
-    res.status(error.response?.status || 500).json({ message: 'تعذر جلب الجلسة النشطة', details: error.message });
+    const status = error.response?.status || 500;
+    res.status(status).json({ statusCode: status, message: `تعذر جلب الجلسة النشطة (رمز: ${status})`, details: error.message });
   }
 });
 
@@ -367,7 +374,8 @@ app.get('/api/ftth/finance', async (req, res) => {
 
     res.json({ wallet, transactions: filteredTx });
   } catch (error) {
-    res.status(error.response?.status || 500).json({ message: 'فشل جلب البيانات المالية', details: error.message });
+    const status = error.response?.status || 500;
+    res.status(status).json({ statusCode: status, message: `فشل جلب البيانات المالية (رمز: ${status})`, details: error.message });
   }
 });
 
@@ -384,7 +392,8 @@ app.get('/api/ftth/operations', async (req, res) => {
 
     res.json({ tickets, requests });
   } catch (error) {
-    res.status(error.response?.status || 500).json({ message: 'فشل جلب التذاكر والمهام', details: error.message });
+    const status = error.response?.status || 500;
+    res.status(status).json({ statusCode: status, message: `فشل جلب التذاكر والمهام (رمز: ${status})`, details: error.message });
   }
 });
 
@@ -426,17 +435,20 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   </style>
 </head>
 <body class="bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100 transition-colors duration-200 min-h-screen">
-  <div id="toast-container" class="fixed bottom-5 left-5 z-50 flex flex-col gap-2 max-w-sm w-full pointer-events-none"></div>
-  <div id="persistent-loader" class="hidden fixed top-0 inset-x-0 z-50 bg-brand-600/95 text-white px-4 py-2.5 shadow-lg backdrop-blur-sm animate-pulse">
+  <div id="toast-container" class="fixed bottom-5 left-5 z-50 flex flex-col gap-2 max-w-md w-full pointer-events-none"></div>
+
+  <!-- شريط التحميل العلوي المستمر -->
+  <div id="persistent-loader" class="hidden fixed top-0 inset-x-0 z-50 bg-brand-600/95 text-white px-4 py-3 shadow-xl backdrop-blur-sm animate-pulse">
     <div class="max-w-7xl mx-auto flex items-center justify-center gap-3 text-sm font-bold">
       <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
         <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
       </svg>
-      <span id="loader-text">جاري سحب ودمج البيانات من منظومة FTTH الأساسية... يرجى الانتظار</span>
+      <span id="loader-text">جاري سحب ودمج البيانات من منظومة FTTH الأساسية... قد تستغرق العملية عدة ثوانٍ</span>
     </div>
   </div>
 
+  <!-- شاشة تسجيل الدخول -->
   <div id="login-view" class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-slate-100 via-blue-50 to-slate-200 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
     <div class="w-full max-w-md bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 p-8">
       <div class="text-center mb-8">
@@ -469,6 +481,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- لوحة التحكم الرئيسية -->
   <div id="app-view" class="hidden min-h-screen flex flex-col">
     <header class="sticky top-0 z-30 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border-b border-slate-200 dark:border-slate-800">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
@@ -490,15 +503,19 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </nav>
 
         <div class="flex items-center gap-2">
-          <button onclick="fetchAllData(true)" title="تحديث البيانات" class="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
+          <button id="refresh-btn" onclick="fetchAllData(true)" title="تحديث البيانات" class="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition flex items-center gap-1.5 text-xs font-bold">
+            <i data-lucide="refresh-cw" id="refresh-icon" class="w-4 h-4"></i>
+            <span class="hidden sm:inline">تحديث</span>
+          </button>
           <button onclick="toggleTheme()" title="الوضع الليلي/النهاري" class="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition"><i data-lucide="moon" id="theme-icon" class="w-4 h-4"></i></button>
           <button onclick="logout()" title="تسجيل الخروج" class="p-2 rounded-xl bg-red-50 dark:bg-red-950/50 text-red-600 hover:bg-red-100 transition"><i data-lucide="log-out" class="w-4 h-4"></i></button>
         </div>
       </div>
     </header>
 
-    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
+    <main class="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 relative">
       <section id="tab-subscribers" class="space-y-6">
+        <!-- الإحصائيات الدائرية -->
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
           <div onclick="setQuickFilter('all')" id="stat-all" class="circular-stat active-filter cursor-pointer bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm flex flex-col items-center text-center ring-brand-500">
             <div class="w-16 h-16 rounded-full border-4 border-brand-500 flex items-center justify-center mb-2 bg-brand-50 dark:bg-brand-950/40">
@@ -532,6 +549,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           </div>
         </div>
 
+        <!-- شريط البحث والأدوات -->
         <div class="bg-white dark:bg-slate-900 p-4 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-4">
           <div class="flex flex-col lg:flex-row gap-3 justify-between">
             <div class="relative flex-1">
@@ -564,7 +582,15 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
+        <!-- جدول المشتركين مع غطاء التحميل -->
+        <div class="relative bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden min-h-[320px]">
+          <!-- غطاء التحميل التفاعلي للجدول -->
+          <div id="table-loading-overlay" class="hidden absolute inset-0 z-20 bg-white/85 dark:bg-slate-900/85 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center">
+            <div class="w-14 h-14 border-4 border-brand-200 border-t-brand-600 rounded-full animate-spin mb-4"></div>
+            <h3 class="text-lg font-extrabold text-slate-900 dark:text-white animate-pulse">جاري سحب ودمج بيانات المشتركين من منظومة FTTH...</h3>
+            <p class="text-xs text-slate-500 dark:text-slate-400 mt-1 max-w-md">قد تستغرق هذه العملية من 10 إلى 30 ثانية حسب عدد المشتركين وسرعة استجابة المنظومة الأساسية. يرجى الانتظار.</p>
+          </div>
+
           <div class="overflow-x-auto">
             <table class="w-full text-right border-collapse">
               <thead>
@@ -582,13 +608,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
                 </tr>
               </thead>
               <tbody id="subscribers-tbody" class="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
-                <tr><td colspan="10" class="p-8 text-center text-slate-400">جاري تحميل قائمة المشتركين...</td></tr>
+                <tr><td colspan="10" class="p-12 text-center text-slate-400 font-bold">في انتظار بدء سحب البيانات...</td></tr>
               </tbody>
             </table>
           </div>
         </div>
       </section>
 
+      <!-- تفاصيل المشترك -->
       <section id="tab-subscriber-detail" class="hidden space-y-6">
         <div class="flex items-center justify-between">
           <button onclick="switchTab('subscribers')" class="px-4 py-2 bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 rounded-xl text-sm font-bold flex items-center gap-2 transition">
@@ -645,6 +672,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </div>
       </section>
 
+      <!-- الوكلاء الثانويين -->
       <section id="tab-agents" class="hidden space-y-6">
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm h-fit">
@@ -691,6 +719,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </div>
       </section>
 
+      <!-- المحفظة والمالية -->
       <section id="tab-finance" class="hidden space-y-6">
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div class="bg-gradient-to-l from-brand-600 to-brand-800 text-white p-6 rounded-2xl shadow-lg">
@@ -731,6 +760,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </div>
       </section>
 
+      <!-- الدعم الفني ومهام التنصيب -->
       <section id="tab-operations" class="hidden space-y-6">
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div class="bg-white dark:bg-slate-900 p-6 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-sm">
@@ -763,7 +793,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       quickFilter: 'all',
       subAgents: [],
       transactions: [],
-      currentDetailSub: null
+      currentDetailSub: null,
+      isFetching: false
     };
 
     document.addEventListener('DOMContentLoaded', () => {
@@ -791,13 +822,28 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       toast.className = \`\${colors[type] || colors.info} px-4 py-3 rounded-xl shadow-xl text-sm font-bold flex items-center justify-between gap-3 pointer-events-auto transform transition-all duration-300\`;
       toast.innerHTML = \`<span>\${message}</span>\`;
       container.appendChild(toast);
-      setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 3500);
+      setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 5500);
     }
 
-    function setLoading(isLoading, text = 'جاري سحب ودمج البيانات من منظومة FTTH الأساسية...') {
+    // إدارة حالة التحميل المستمرة (شريط علوي + غطاء الجدول + تعطيل زر التحديث)
+    function setLoading(isLoading, text = 'جاري سحب ودمج البيانات من منظومة FTTH الأساسية... قد تستغرق العملية عدة ثوانٍ') {
+      state.isFetching = isLoading;
       const loader = document.getElementById('persistent-loader');
+      const tableOverlay = document.getElementById('table-loading-overlay');
+      const refreshBtn = document.getElementById('refresh-btn');
+      const refreshIcon = document.getElementById('refresh-icon');
+
       document.getElementById('loader-text').textContent = text;
       loader.classList.toggle('hidden', !isLoading);
+      if (tableOverlay) tableOverlay.classList.toggle('hidden', !isLoading);
+      
+      if (refreshBtn) {
+        refreshBtn.disabled = isLoading;
+        refreshBtn.classList.toggle('opacity-50', isLoading);
+      }
+      if (refreshIcon) {
+        refreshIcon.classList.toggle('animate-spin', isLoading);
+      }
     }
 
     function switchLoginRole(mode) {
@@ -828,7 +874,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             body: JSON.stringify({ username, password })
           });
           const data = await res.json();
-          if (!res.ok) throw new Error(data.message || 'فشل تسجيل الدخول');
+          if (!res.ok) throw new Error(data.message || \`فشل تسجيل الدخول (رمز: \${res.status})\`);
 
           localStorage.setItem('war_ftth_token', data.token);
           localStorage.setItem('war_master_ftth_token', data.token);
@@ -850,7 +896,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             body: JSON.stringify({ username, password })
           });
           const data = await res.json();
-          if (!res.ok) throw new Error(data.message || 'فشل دخول الوكيل الثانوي');
+          if (!res.ok) throw new Error(data.message || \`فشل دخول الوكيل الثانوي (رمز: \${res.status})\`);
 
           localStorage.setItem('war_ftth_token', masterToken);
           localStorage.setItem('war_user_role', 'sub_agent');
@@ -915,8 +961,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       });
     }
 
+    // جلب كافة البيانات مع عرض رمز الاستجابة الدقيق ومؤشر التحميل المستمر
     async function fetchAllData(notify = false) {
-      setLoading(true, 'جاري سحب ودمج بيانات المشتركين والوكلاء من منظومة FTTH...');
+      if (state.isFetching) return;
+      setLoading(true, 'جاري سحب ودمج بيانات المشتركين من منظومة FTTH... يرجى الانتظار حتى اكتمال السحب.');
+      
       try {
         const headers = { 'x-ftth-token': state.token };
         if (state.role === 'sub_agent' && state.subAgentId) {
@@ -924,25 +973,39 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         }
 
         const subRes = await fetch('/api/ftth/merged-subscribers', { headers });
-        if (subRes.status === 401) {
-          showToast('انتهت صلاحية الجلسة، يرجى تسجيل الدخول مجدداً', 'error');
+        const statusCode = subRes.status;
+
+        if (statusCode === 401) {
+          showToast(\`فشل سحب المشتركين [رمز الاستجابة: 401] - انتهت صلاحية الجلسة، يرجى إعادة الدخول.\`, 'error');
           logout();
           return;
         }
-        const subData = await subRes.json();
-        if (!subRes.ok) throw new Error(subData.message);
+
+        let subData = {};
+        try {
+          subData = await subRes.json();
+        } catch (parseErr) {
+          throw new Error(\`فشل سحب المشتركين [رمز الاستجابة: \${statusCode}] - استجابة غير صالحة من الخادم.\`);
+        }
+
+        if (!subRes.ok) {
+          throw new Error(subData.message || \`فشل سحب المشتركين [رمز الاستجابة: \${statusCode}]\`);
+        }
 
         state.allSubscribers = subData.subscribers || [];
         updateStats();
         applyFilters();
 
         if (state.role === 'admin') {
+          setLoading(true, 'تم جلب المشتركين، جاري تحديث المحفظة والوكلاء الثانويين...');
           await Promise.all([loadSubAgents(), loadFinance(), loadOperations()]);
         }
 
-        if (notify) showToast('تم تحديث جميع البيانات بنجاح', 'success');
+        if (notify) showToast(\`تم سحب وتحديث \${state.allSubscribers.length} مشترك بنجاح\`, 'success');
       } catch (err) {
-        showToast(err.message || 'حدث خطأ أثناء جلب البيانات', 'error');
+        const msg = err.message.includes('رمز الاستجابة') ? err.message : \`فشل سحب المشتركين - \${err.message}\`;
+        showToast(msg, 'error');
+        document.getElementById('subscribers-tbody').innerHTML = \`<tr><td colspan="10" class="p-8 text-center text-red-500 font-bold">\${msg}</td></tr>\`;
       } finally {
         setLoading(false);
       }
@@ -1130,7 +1193,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       const headers = { 'x-ftth-token': state.token };
 
       fetch(\`/api/ftth/ont?subscriptionId=\${sub.id}\`, { headers })
-        .then(r => r.json())
+        .then(async r => {
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.message || \`خطأ \${r.status}\`);
+          return data;
+        })
         .then(data => {
           const rx = data.rxPower ?? data.opticalRxPower ?? data.signal ?? 'غير متاح';
           const tx = data.txPower ?? data.opticalTxPower ?? 'غير متاح';
@@ -1145,10 +1212,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">Serial Number:</span><span class="font-mono text-xs">\${data.serialNumber || data.sn || '-'}</span></div>
           \`;
         })
-        .catch(() => { ontBox.innerHTML = '<div class="p-4 text-center text-red-500 text-xs font-bold">تعذر الوصول إلى جهاز ONT حالياً.</div>'; });
+        .catch(err => { ontBox.innerHTML = \`<div class="p-4 text-center text-red-500 text-xs font-bold">\${err.message}</div>\`; });
 
       fetch(\`/api/ftth/sessions?subscriptionId=\${sub.id}\`, { headers })
-        .then(r => r.json())
+        .then(async r => {
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.message || \`خطأ \${r.status}\`);
+          return data;
+        })
         .then(data => {
           const session = Array.isArray(data) ? data[0] : (data.items?.[0] || data);
           if (!session || (!session.ipAddress && !session.framedIpAddress && !session.macAddress)) {
@@ -1161,7 +1232,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
             <div class="flex justify-between p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800"><span class="text-slate-500">مدة الاتصال (Uptime):</span><span class="font-bold">\${session.uptime || session.duration || 'متصل الآن'}</span></div>
           \`;
         })
-        .catch(() => { sesBox.innerHTML = '<div class="p-4 text-center text-red-500 text-xs font-bold">تعذر جلب تفاصيل الجلسة.</div>'; });
+        .catch(err => { sesBox.innerHTML = \`<div class="p-4 text-center text-red-500 text-xs font-bold">\${err.message}</div>\`; });
     }
 
     async function loadSubAgents() {
